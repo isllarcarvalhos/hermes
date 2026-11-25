@@ -135,3 +135,44 @@ def test_read_extract_docx_and_multisheet_xlsx_zip_bombs_rejected(tmp_path: Path
     xlsx_bomb.write_bytes(xbuf.getvalue())
     with pytest.raises(ExtractionError, match="exceeds safe decompressed size limit"):
         _extract_xlsx(str(xlsx_bomb))
+
+
+def test_read_file_native_pdf_never_bypasses_secret_redaction(tmp_path: Path, monkeypatch):
+    import zlib
+
+    secret = "ghp_1234567890abcdefghij1234567890abcd"
+    plain_secret_pdf = tmp_path / "plain_secret.pdf"
+    plain_secret_pdf.write_bytes(
+        b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n"
+        + f"% Token: {secret}\n".encode("ascii")
+        + b"%%EOF\n"
+    )
+    flate_stream = zlib.compress(f"BT ({secret}) Tj ET".encode("ascii"))
+    flate_secret_pdf = tmp_path / "flate_secret.pdf"
+    flate_secret_pdf.write_bytes(
+        b"%PDF-1.4\n1 0 obj << /Filter /FlateDecode >>\nstream\n"
+        + flate_stream
+        + b"\nendstream\nendobj\n%%EOF\n"
+    )
+    tj_split_pdf = tmp_path / "tj_secret.pdf"
+    tj_split_pdf.write_bytes(
+        b"%PDF-1.4\n1 0 obj\nstream\n"
+        + zlib.compress(f"BT [({secret[:14]}) -10 ({secret[14:]})] TJ ET".encode("ascii"))
+        + b"\nendstream\nendobj\n%%EOF\n"
+    )
+    clean_pdf = tmp_path / "clean.pdf"
+    clean_pdf.write_bytes(_TINY_PDF)
+
+    _repeat_counts.clear()
+    monkeypatch.delenv(DELEGATED_CHILD_ENV_MARKER, raising=False)
+    with (
+        patch("agent.image_routing._runtime_main", side_effect=lambda k: {"provider": "gemini", "model": "gemini-4-neon", "base_url": "", "requested_provider": "gemini"}.get(k, "")),
+        patch("hermes_cli.config.load_config", return_value={"agent": {"pdf_input_mode": "native"}}),
+    ):
+        for secret_pdf in (plain_secret_pdf, flate_secret_pdf, tj_split_pdf):
+            res = registry.dispatch("read_file", {"path": str(secret_pdf), "offset": 1, "limit": 100})
+            assert isinstance(res, str), f"Secret-bearing PDF {secret_pdf.name} must NOT attach natively"
+            assert secret not in res
+
+        clean_res = registry.dispatch("read_file", {"path": str(clean_pdf), "offset": 1, "limit": 100})
+        assert isinstance(clean_res, dict) and clean_res.get("_multimodal") is True

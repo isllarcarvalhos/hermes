@@ -452,3 +452,74 @@ def test_bedrock_user_turn_omission_anthropic_gemini_parity_and_user_turn_helper
     assert strip_images_for_rejecting_model(agent, pdf_only) is True
     assert len(pdf_only) == 1 and pdf_only[0]["role"] == "user"
     assert isinstance(pdf_only[0]["content"], str) and "document content removed" in pdf_only[0]["content"].lower()
+
+
+def test_chat_completions_transport_gating_mixed_rejection_and_corrupt_image_isolation():
+    from agent.message_sanitization import _strip_images_from_messages
+
+    # 1. Chat Completions route whose models.dev entry declares audio+pdf MUST still strip raw Gemini-shaped
+    #    {type: "audio"|"document", mime_type, data} parts (Chat Completions does not accept that wire schema).
+    class _OpenAIChatAgent(VisionMessagePrepMixin):
+        provider = "openai"
+        model = "gpt-4o-audio-preview"
+        api_mode = "chat_completions"
+        base_url = "https://api.openai.com/v1"
+        requested_provider = "openai"
+        _no_list_tool_content_models = set()
+
+    oa = _OpenAIChatAgent()
+    caps_all = ModelCapabilities(supports_vision=True, input_modalities=frozenset({"text", "image", "audio", "pdf"}))
+    with (
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("agent.models_dev.get_model_capabilities", return_value=caps_all),
+    ):
+        assert oa._model_supports_audio() is False
+        assert oa._model_supports_document() is False
+        raw_user = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect these"},
+                {"type": "audio", "mime_type": "audio/wav", "data": _TINY_WAV_B64},
+                {"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64},
+            ],
+        }]
+        prepared = oa._prepare_messages_for_non_vision_model(raw_user)
+        part_types = [p["type"] for p in prepared[0]["content"]]
+        assert part_types == ["text", "text", "text"]
+        assert "audio" in prepared[0]["content"][1]["text"].lower()
+        assert "document" in prepared[0]["content"][2]["text"].lower()
+
+    # 2. Generic "unexpected item type in content" on mixed image+audio+document must NOT poison vision
+    #    on the first failure: strip audio/document first, keeping image intact for retry.
+    mixed_agent = _DummyAgent(vision=True, video=False, audio=True, doc=True, provider="dashscope", model="qwen-vl")
+    mixed_msgs = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "check"},
+            {"type": "image_url", "image_url": {"url": _TINY_1X1_PNG_URL}},
+            {"type": "audio", "mime_type": "audio/wav", "data": _TINY_WAV_B64},
+            {"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64},
+        ],
+    }]
+    assert record_media_rejection(mixed_agent, "unexpected item type in content", mixed_msgs) == "audio/document"
+    assert mixed_agent._image_rejecting_models == set()
+    retry_copy = [dict(mixed_msgs[0], content=list(mixed_msgs[0]["content"]))]
+    assert strip_images_for_rejecting_model(mixed_agent, retry_copy) is True
+    assert [p["type"] for p in retry_copy[0]["content"]] == ["text", "image_url"]
+    # If the image-only retry STILL fails with the same generic error, then mark image-rejecting
+    assert record_media_rejection(mixed_agent, "unexpected item type in content", retry_copy) == "image"
+    assert ("dashscope", "qwen-vl") in mixed_agent._image_rejecting_models
+
+    # 3. _strip_images_from_messages (used for corrupt-image retry) removes ONLY images, keeping healthy media intact
+    corrupt_retry = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "mixed"},
+            {"type": "image_url", "image_url": {"url": _TINY_1X1_PNG_URL}},
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}},
+            {"type": "audio", "mime_type": "audio/wav", "data": _TINY_WAV_B64},
+            {"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64},
+        ],
+    }]
+    assert _strip_images_from_messages(corrupt_retry) is True
+    assert [p["type"] for p in corrupt_retry[0]["content"]] == ["text", "video_url", "audio", "document"]

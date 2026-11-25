@@ -691,8 +691,11 @@ def supports_audio_in_user_turns(
     cfg: Optional[dict[str, Any]] = None,
     *,
     base_url: str = "",
+    api_mode: str = "",
 ) -> bool:
     """Whether provider+model accepts native audio inside user-turn messages."""
+    if api_mode in ("anthropic_messages", "bedrock_converse", "codex_responses"):
+        return False
     return _is_native_gemini_user_media_route(provider, model, cfg, base_url=base_url)
 
 
@@ -705,8 +708,10 @@ def supports_pdf_in_user_turns(
     api_mode: str = "",
 ) -> bool:
     """Whether provider+model accepts native PDF documents inside user-turn messages."""
+    if api_mode in ("bedrock_converse", "codex_responses"):
+        return False
     p = _clean_str(provider).lower()
-    if api_mode == "anthropic_messages" or p == "anthropic":
+    if api_mode == "anthropic_messages" or (not api_mode and p == "anthropic"):
         return bool(_clean_str(model))
     return _is_native_gemini_user_media_route(provider, model, cfg, base_url=base_url)
 

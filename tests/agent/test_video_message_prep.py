@@ -87,7 +87,7 @@ def test_video_token_estimation_compaction_bedrock_and_sanitization():
     from agent.bedrock_adapter import _convert_content_to_converse
     from agent.chat_completion_helpers import estimate_request_context_tokens
     from agent.context_compressor import _strip_historical_media
-    from agent.message_sanitization import _messages_carry_images, _strip_images_from_messages
+    from agent.message_sanitization import _messages_carry_images, _strip_all_media_from_messages
     from agent.model_metadata import estimate_messages_tokens_rough
     from agent.trace_upload import _tool_result_message
 
@@ -130,10 +130,10 @@ def test_video_token_estimation_compaction_bedrock_and_sanitization():
     assert any("video" in b.get("text", "").lower() for b in converse_blocks)
     assert all(huge_b64 not in str(b) for b in converse_blocks)
 
-    # Message sanitization strips rejected video parts cleanly
+    # Message sanitization strips rejected video parts cleanly for a rejecting model
     san_copy = [dict(video_msg, content=list(video_msg["content"]))]
     assert _messages_carry_images(san_copy) is True
-    assert _strip_images_from_messages(san_copy) is True
+    assert _strip_all_media_from_messages(san_copy) is True
     assert all(p.get("type") != "video_url" for p in san_copy[0]["content"] if isinstance(p, dict))
 
     # Trace upload _tool_result_message never dumps base64 for in-memory list content

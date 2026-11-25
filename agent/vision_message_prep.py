@@ -208,7 +208,7 @@ class VisionMessagePrepMixin:
             return False
 
     def _model_supports_audio(self) -> bool:
-        """True if the active provider+model accepts native audio parts in user turns."""
+        """True if the active provider+model+transport accepts Hermes native audio parts in user turns."""
         try:
             from hermes_cli.config import load_config
             from agent.image_routing import _coerce_audio_mode, _lookup_supports_audio, supports_audio_in_user_turns
@@ -216,23 +216,21 @@ class VisionMessagePrepMixin:
             model = (getattr(self, "model", "") or "").strip()
             base_url = (getattr(self, "base_url", "") or "").strip()
             requested_provider = (getattr(self, "requested_provider", "") or "").strip()
-            if provider.lower() == "bedrock":
-                return False
+            api_mode = (getattr(self, "api_mode", "") or "").strip()
             cfg = load_config()
+            if not supports_audio_in_user_turns(provider, model, cfg, base_url=base_url, api_mode=api_mode):
+                return False
             verdict = _lookup_supports_audio(
                 provider, model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
             )
             if verdict is not None:
                 return verdict is True
-            return (
-                supports_audio_in_user_turns(provider, model, cfg, base_url=base_url)
-                and _coerce_audio_mode(((cfg or {}).get("agent") or {}).get("audio_input_mode")) == "native"
-            )
+            return _coerce_audio_mode(((cfg or {}).get("agent") or {}).get("audio_input_mode")) == "native"
         except (ImportError, KeyError, TypeError, ValueError, OSError, RuntimeError, AttributeError):
             return False
 
     def _model_supports_document(self) -> bool:
-        """True if the active provider+model accepts native document (PDF) parts in user turns."""
+        """True if the active provider+model+transport accepts Hermes native document (PDF) parts in user turns."""
         try:
             from hermes_cli.config import load_config
             from agent.image_routing import _coerce_pdf_mode, _lookup_supports_pdf, supports_pdf_in_user_turns
@@ -241,10 +239,9 @@ class VisionMessagePrepMixin:
             base_url = (getattr(self, "base_url", "") or "").strip()
             requested_provider = (getattr(self, "requested_provider", "") or "").strip()
             api_mode = (getattr(self, "api_mode", "") or "").strip()
-            # Bedrock Converse does not emit inline document blocks; strip unless on Anthropic Messages transport.
-            if provider.lower() == "bedrock" and api_mode != "anthropic_messages":
-                return False
             cfg = load_config()
+            if not supports_pdf_in_user_turns(provider, model, cfg, base_url=base_url, api_mode=api_mode):
+                return False
             verdict = _lookup_supports_pdf(
                 provider, model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
             )
@@ -252,10 +249,7 @@ class VisionMessagePrepMixin:
                 return verdict is True
             if api_mode == "anthropic_messages" or provider.lower() == "anthropic":
                 return True
-            return (
-                supports_pdf_in_user_turns(provider, model, cfg, base_url=base_url, api_mode=api_mode)
-                and _coerce_pdf_mode(((cfg or {}).get("agent") or {}).get("pdf_input_mode")) == "native"
-            )
+            return _coerce_pdf_mode(((cfg or {}).get("agent") or {}).get("pdf_input_mode")) == "native"
         except (ImportError, KeyError, TypeError, ValueError, OSError, RuntimeError, AttributeError):
             return False
 

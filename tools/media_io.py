@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
-from typing import Optional
+import zlib
+from typing import Callable, Optional
 
 from tools.audio_container import sniff_container
 
 MAX_NATIVE_MEDIA_RAW_BYTES = 15 * 1024 * 1024  # ~20 MB base64 inline cap
+_MAX_PDF_SCAN_DECOMPRESS_BYTES = 20 * 1024 * 1024
+_PDF_STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\n?endstream", re.DOTALL)
+_PDF_TJ_SPLIT_RE = re.compile(r"\)\s*-?\d+(?:\.\d+)?\s*\(")
+_PDF_UTF16BE_STR_RE = re.compile(rb"\(\xfe\xff([^)]{2,4096})\)")
 
 _AUDIO_MIME_ALIASES: dict[str, str] = {
     "audio/x-wav": "audio/wav",
@@ -117,6 +123,54 @@ def read_file_bounded_nofollow(path: str, *, max_bytes: int = MAX_NATIVE_MEDIA_R
 def is_valid_pdf_bytes(data: bytes) -> bool:
     """True when *data* begins with a genuine ``%PDF-`` header."""
     return bool(data) and data[:5] == b"%PDF-"
+
+
+def _text_triggers_redaction(text: str, redactor: Callable[[str], str]) -> bool:
+    if not text:
+        return False
+    if redactor(text) != text:
+        return True
+    if ")(" in text or ")" in text:
+        joined = _PDF_TJ_SPLIT_RE.sub("", text)
+        if joined != text and redactor(joined) != joined:
+            return True
+    return False
+
+
+def pdf_has_redacted_text(data: bytes, redactor: Callable[[str], str]) -> bool:
+    """Return True if raw PDF bytes or bounded FlateDecode streams contain redactable secrets.
+
+    Fails closed (returns True) on encrypted PDFs or oversized FlateDecode streams so raw bytes
+    are never attached natively when secret scanning cannot complete safely.
+    """
+    if not data:
+        return False
+    if b"/Encrypt" in data:
+        return True
+    if _text_triggers_redaction(data.decode("latin-1", errors="ignore"), redactor):
+        return True
+    for match in _PDF_UTF16BE_STR_RE.finditer(data):
+        decoded = match.group(1).decode("utf-16-be", errors="ignore")
+        if decoded and redactor(decoded) != decoded:
+            return True
+    remaining = _MAX_PDF_SCAN_DECOMPRESS_BYTES
+    for match in _PDF_STREAM_RE.finditer(data):
+        body = match.group(1)
+        if not body:
+            continue
+        try:
+            decomp = zlib.decompressobj()
+            inflated = decomp.decompress(body, remaining + 1)
+            if len(inflated) <= remaining and not decomp.unconsumed_tail:
+                inflated += decomp.flush(remaining - len(inflated) + 1)
+        except zlib.error:
+            continue
+        if len(inflated) > remaining or decomp.unconsumed_tail:
+            return True  # fail closed on oversized/bomb compressed stream
+        remaining -= len(inflated)
+        if _text_triggers_redaction(inflated.decode("latin-1", errors="ignore"), redactor):
+            return True
+    return False
 
 
 def is_valid_audio_bytes(data: bytes) -> bool:

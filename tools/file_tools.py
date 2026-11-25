@@ -430,6 +430,8 @@ def _try_read_native_pdf(path: str, _resolved, offset: int, task_id: str):
     """
     if offset != 1 or _resolved.suffix.lower() != ".pdf":
         return None
+    if _is_secret_file_arg(str(_resolved)):
+        return None
     from tools.file_tools_read_tracking import _programmatic_read
     if _programmatic_read.get():
         return None
@@ -456,7 +458,12 @@ def _try_read_native_pdf(path: str, _resolved, offset: int, task_id: str):
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         return None
 
-    from tools.media_io import MAX_NATIVE_MEDIA_RAW_BYTES, is_valid_pdf_bytes, read_file_bounded_nofollow
+    from tools.media_io import (
+        MAX_NATIVE_MEDIA_RAW_BYTES,
+        is_valid_pdf_bytes,
+        pdf_has_redacted_text,
+        read_file_bounded_nofollow,
+    )
     from tools.vision_tools_history_budget import release_embed_key, reserve_embed
 
     refusal, reserved_key = reserve_embed(str(_resolved), tool_name="read_file", media_label="PDF")
@@ -465,6 +472,12 @@ def _try_read_native_pdf(path: str, _resolved, offset: int, task_id: str):
 
     raw = read_file_bounded_nofollow(str(_resolved), max_bytes=MAX_NATIVE_MEDIA_RAW_BYTES)
     if raw is None or not is_valid_pdf_bytes(raw):
+        release_embed_key(reserved_key)
+        return None
+    if pdf_has_redacted_text(
+        raw,
+        lambda text: redact_sensitive_text(text, file_read=True, secret_file=False),
+    ):
         release_embed_key(reserved_key)
         return None
 

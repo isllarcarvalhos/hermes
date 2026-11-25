@@ -402,14 +402,18 @@ def _strip_media_types_from_messages(
 
 
 def _strip_images_from_messages(messages: list) -> bool:
-    """Remove media content parts from all messages in-place (server rejected images).
+    """Remove image content parts from all messages in-place (corrupt-image or image-only strip).
 
-    ``tool`` / ``tool_calls`` messages left empty get a placeholder, NOT deleted (deleting
-    orphans the paired ``tool_call_id`` → HTTP 400); other now-empty messages are dropped.
-    Rewritten messages lose their ``api_content`` sidecar (it carries the removed images):
-    a caller rewriting a persisted row must not leave bytes that replay them next turn. The
-    current callers pass per-call clones, where this is a no-op.
+    Restricted to ``_IMAGE_PART_TYPES`` so corrupt-image retry preserves healthy audio, PDF,
+    and video parts in the same request. ``tool`` / ``tool_calls`` messages left empty get a
+    placeholder, NOT deleted (deleting orphans the paired ``tool_call_id`` → HTTP 400); other
+    now-empty messages are dropped.
     """
+    return _strip_media_types_from_messages(messages, _IMAGE_PART_TYPES, label="image")
+
+
+def _strip_all_media_from_messages(messages: list) -> bool:
+    """Remove all media content parts (image, video, audio, document) for a text-only rejecting model."""
     return _strip_media_types_from_messages(messages, _ALL_MEDIA_PART_TYPES, label="image")
 
 
@@ -459,6 +463,15 @@ _IMAGE_CORRUPT_PHRASES = (
     "failed to decode image",
 )
 
+_GENERIC_CONTENT_REJECTION_PHRASES = (
+    # DashScope-style gateways reject non-text or unknown media blocks with this generic body (issue #57948).
+    "unexpected item type in content",
+)
+
+_EXPLICIT_IMAGE_REJECTION_PHRASES = tuple(
+    p for p in _IMAGE_REJECTION_PHRASES if p not in _GENERIC_CONTENT_REJECTION_PHRASES
+)
+
 _AUDIO_REJECTION_PHRASES = (
     "audio is not supported", "audio content is not supported", "audio input is not supported",
     "does not support audio", "model does not support audio", "input_audio is not supported",
@@ -502,7 +515,7 @@ def strip_images_for_rejecting_model(agent: Any, api_messages: Any) -> bool:
         return False
     key = _provider_model_key(agent)
     if key in (getattr(agent, "_image_rejecting_models", None) or ()):
-        return _strip_images_from_messages(api_messages)
+        return _strip_all_media_from_messages(api_messages)
     mods = _rejected_modalities_map(agent).get(key)
     if not mods:
         return False
@@ -563,14 +576,19 @@ def record_media_rejection(agent: Any, error_body: str, messages: Any) -> str | 
         return "document"
     if not _looks_like_image_content_rejection(error_body):
         return None
+    body_low = str(error_body or "").lower()
+    is_generic_only = not any(phrase in body_low for phrase in _EXPLICIT_IMAGE_REJECTION_PHRASES)
+    unrejected_non_image = [
+        name for name, mtypes in (("audio", _AUDIO_PART_TYPES), ("document", _DOCUMENT_PART_TYPES))
+        if name not in rejected_mods and _messages_carry_media_types(messages, mtypes)
+    ]
+    if is_generic_only and unrejected_non_image:
+        mod_map.setdefault(key, set()).update(unrejected_non_image)
+        return "/".join(unrejected_non_image)
     if not _messages_carry_media_types(messages, _IMAGE_PART_TYPES | _VIDEO_PART_TYPES):
-        added = [
-            name for name, mtypes in (("audio", _AUDIO_PART_TYPES), ("document", _DOCUMENT_PART_TYPES))
-            if name not in rejected_mods and _messages_carry_media_types(messages, mtypes)
-        ]
-        if added:
-            mod_map.setdefault(key, set()).update(added)
-            return "/".join(added)
+        if unrejected_non_image:
+            mod_map.setdefault(key, set()).update(unrejected_non_image)
+            return "/".join(unrejected_non_image)
         return None
     img_rejected = getattr(agent, "_image_rejecting_models", None)
     if not isinstance(img_rejected, set):
@@ -624,6 +642,7 @@ __all__ = [
     "_sanitize_structure_surrogates",
     "_sanitize_surrogates",
     "_sanitize_tools_non_ascii",
+    "_strip_all_media_from_messages",
     "_strip_images_from_messages",
     "_strip_non_ascii",
     "apply_reasoning_content_policy",
