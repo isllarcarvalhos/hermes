@@ -389,3 +389,66 @@ def test_token_estimation_traces_and_many_image_safe_eviction():
         ],
     ]
     assert evict_stale_outbound_tool_images(api_messages) == 0
+
+
+def test_bedrock_user_turn_omission_anthropic_gemini_parity_and_user_turn_helpers():
+    from agent.image_routing import supports_audio_in_user_turns, supports_pdf_in_user_turns
+
+    # User-turn helpers allow Anthropic (PDF) and Gemini 2.5 (audio & PDF) while tool-result gating stays Gemini 3+
+    assert supports_pdf_in_user_turns("anthropic", "claude-sonnet-4-5", {}, api_mode="anthropic_messages") is True
+    assert supports_pdf_in_tool_results("anthropic", "claude-sonnet-4-5", {}) is False
+    assert supports_pdf_in_user_turns("gemini", "gemini-2.5-pro", {}) is True
+    assert supports_audio_in_user_turns("gemini", "gemini-2.5-pro", {}) is True
+    assert supports_audio_in_tool_results("gemini", "gemini-2.5-pro", {}) is False
+
+    # Bedrock Converse user turns emit explicit omission text for audio/document (never silently dropped to "(empty)")
+    _, converse_user = convert_messages_to_converse([{
+        "role": "user",
+        "content": [
+            {"type": "input_audio", "input_audio": {"data": _TINY_WAV_B64, "format": "wav"}},
+            {"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64},
+        ],
+    }])
+    converse_texts = [b["text"] for b in converse_user[0]["content"]]
+    assert any("audio" in t.lower() and "omitted" in t.lower() for t in converse_texts)
+    assert any("document" in t.lower() and "omitted" in t.lower() for t in converse_texts)
+
+    # Bedrock Converse VisionMessagePrep strips user-turn PDFs even if models.dev advertises pdf support
+    class _BedrockConverseAgent(VisionMessagePrepMixin):
+        provider = "bedrock"
+        model = "anthropic.claude-sonnet-4-5"
+        api_mode = "bedrock_converse"
+        base_url = ""
+        requested_provider = "bedrock"
+        _no_list_tool_content_models = set()
+
+    bc = _BedrockConverseAgent()
+    with patch("hermes_cli.config.load_config", return_value={}):
+        assert bc._model_supports_document() is False
+        assert bc._model_supports_audio() is False
+
+    # Anthropic converter rejects malformed base64 PDFs instead of passing invalid payloads
+    assert _convert_content_part_to_anthropic(
+        {"type": "document", "mime_type": "application/pdf", "data": "not!valid!b64"}
+    ) == {"type": "text", "text": "[document omitted — unsupported by Anthropic]"}
+
+    # Gemini & Interactions adapters both accept Anthropic-shaped {type: "document", source: {type: "base64", ...}}
+    anthropic_doc = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": _TINY_PDF_B64},
+    }
+    assert _inline_data_part(anthropic_doc) == {"inlineData": {"mimeType": "application/pdf", "data": _TINY_PDF_B64}}
+    profile = get_provider_profile("gemini")
+    pkg = sys.modules[type(profile).__module__].__package__
+    interactions = importlib.import_module(f"{pkg}.interactions")
+    assert interactions._document_content(anthropic_doc) == {
+        "type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64,
+    }
+
+    # Per-modality rejection preserves media-only user turns as a placeholder instead of deleting them
+    agent = _DummyAgent(vision=True, video=False, audio=False, doc=True, provider="custom", model="m-user-only")
+    pdf_only = [{"role": "user", "content": [{"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64}]}]
+    assert record_media_rejection(agent, "pdf input is not supported", pdf_only) == "document"
+    assert strip_images_for_rejecting_model(agent, pdf_only) is True
+    assert len(pdf_only) == 1 and pdf_only[0]["role"] == "user"
+    assert isinstance(pdf_only[0]["content"], str) and "document content removed" in pdf_only[0]["content"].lower()

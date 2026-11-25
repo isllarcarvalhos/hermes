@@ -211,19 +211,21 @@ class VisionMessagePrepMixin:
         """True if the active provider+model accepts native audio parts in user turns."""
         try:
             from hermes_cli.config import load_config
-            from agent.image_routing import _coerce_audio_mode, _lookup_supports_audio, supports_audio_in_tool_results
+            from agent.image_routing import _coerce_audio_mode, _lookup_supports_audio, supports_audio_in_user_turns
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
             base_url = (getattr(self, "base_url", "") or "").strip()
             requested_provider = (getattr(self, "requested_provider", "") or "").strip()
+            if provider.lower() == "bedrock":
+                return False
             cfg = load_config()
             verdict = _lookup_supports_audio(
-                provider, model, cfg, requested_provider=requested_provider, allow_network=False,
+                provider, model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
             )
             if verdict is not None:
                 return verdict is True
             return (
-                supports_audio_in_tool_results(provider, model, cfg, base_url=base_url)
+                supports_audio_in_user_turns(provider, model, cfg, base_url=base_url)
                 and _coerce_audio_mode(((cfg or {}).get("agent") or {}).get("audio_input_mode")) == "native"
             )
         except (ImportError, KeyError, TypeError, ValueError, OSError, RuntimeError, AttributeError):
@@ -233,21 +235,25 @@ class VisionMessagePrepMixin:
         """True if the active provider+model accepts native document (PDF) parts in user turns."""
         try:
             from hermes_cli.config import load_config
-            from agent.image_routing import _coerce_pdf_mode, _lookup_supports_pdf, supports_pdf_in_tool_results
+            from agent.image_routing import _coerce_pdf_mode, _lookup_supports_pdf, supports_pdf_in_user_turns
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
             base_url = (getattr(self, "base_url", "") or "").strip()
             requested_provider = (getattr(self, "requested_provider", "") or "").strip()
+            api_mode = (getattr(self, "api_mode", "") or "").strip()
+            # Bedrock Converse does not emit inline document blocks; strip unless on Anthropic Messages transport.
+            if provider.lower() == "bedrock" and api_mode != "anthropic_messages":
+                return False
             cfg = load_config()
             verdict = _lookup_supports_pdf(
-                provider, model, cfg, requested_provider=requested_provider, allow_network=False,
+                provider, model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
             )
             if verdict is not None:
                 return verdict is True
-            if getattr(self, "api_mode", "") == "anthropic_messages" or provider.lower() == "anthropic":
+            if api_mode == "anthropic_messages" or provider.lower() == "anthropic":
                 return True
             return (
-                supports_pdf_in_tool_results(provider, model, cfg, base_url=base_url)
+                supports_pdf_in_user_turns(provider, model, cfg, base_url=base_url, api_mode=api_mode)
                 and _coerce_pdf_mode(((cfg or {}).get("agent") or {}).get("pdf_input_mode")) == "native"
             )
         except (ImportError, KeyError, TypeError, ValueError, OSError, RuntimeError, AttributeError):
@@ -343,13 +349,21 @@ class VisionMessagePrepMixin:
         has_videos = any(isinstance(m, dict) and self._content_has_video_parts(m.get("content")) for m in api_messages)
         has_audio = any(isinstance(m, dict) and self._content_has_audio_parts(m.get("content")) for m in api_messages)
         has_docs = any(isinstance(m, dict) and self._content_has_document_parts(m.get("content")) for m in api_messages)
+        has_tool_audio = has_audio and any(
+            isinstance(m, dict) and m.get("role") == "tool" and self._content_has_audio_parts(m.get("content"))
+            for m in api_messages
+        )
+        has_tool_docs = has_docs and any(
+            isinstance(m, dict) and m.get("role") == "tool" and self._content_has_document_parts(m.get("content"))
+            for m in api_messages
+        )
 
         strip_images = has_images and not self._model_supports_vision()
         strip_videos = has_videos and not self._model_supports_video()
         strip_audio_user = has_audio and not self._model_supports_audio()
         strip_docs_user = has_docs and not self._model_supports_document()
-        strip_audio_tool = has_audio and (strip_audio_user or not self._model_supports_audio_in_tool_results())
-        strip_docs_tool = has_docs and (strip_docs_user or not self._model_supports_document_in_tool_results())
+        strip_audio_tool = has_tool_audio and (strip_audio_user or not self._model_supports_audio_in_tool_results())
+        strip_docs_tool = has_tool_docs and (strip_docs_user or not self._model_supports_document_in_tool_results())
         if not (strip_images or strip_videos or strip_audio_user or strip_docs_user or strip_audio_tool or strip_docs_tool):
             return api_messages
 

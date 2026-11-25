@@ -54,8 +54,9 @@ def _compute_host_turn_frame(
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
-        attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
-        attached_docs = list(attached_documents if attached_documents is not None else session.get("attached_documents", []))
+        consume_live = image_paths is None and attached_documents is None
+        attached_images = list(session.get("attached_images", []) if consume_live else (image_paths or []))
+        attached_docs = list(session.get("attached_documents", []) if consume_live else (attached_documents or []))
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
@@ -354,9 +355,8 @@ def _submit_prompt_to_compute_host(
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
-        if image_paths is None:
-            session["attached_images"] = []
         if image_paths is None and attached_documents is None:
+            session["attached_images"] = []
             session["attached_documents"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 

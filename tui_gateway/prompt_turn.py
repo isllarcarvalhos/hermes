@@ -148,16 +148,9 @@ def _admit_prompt_turn(
                 # the session already held stays for close's own handoff (_settle_isolated_turn_before_close).
                 _release_active_session_slot(session)
             return None
-        images = list(session.get("attached_images", []) if image_paths is None else image_paths)
-        if attached_documents is not None:
-            session["_turn_attached_documents"] = list(attached_documents)
-        elif image_paths is None:
-            session["attached_images"] = []
-            session["_turn_attached_documents"] = list(session.pop("attached_documents", []))
-        else:
-            session["_turn_attached_documents"] = []
-        if image_paths is None and attached_documents is not None:
-            session["attached_images"] = []
+        consume_live = image_paths is None and attached_documents is None
+        images = list(session.get("attached_images", []) if consume_live else (image_paths or []))
+        turn_docs = list(session.get("attached_documents", []) if consume_live else (attached_documents or []))
         inflight = session.get("inflight_turn")
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
@@ -167,7 +160,12 @@ def _admit_prompt_turn(
         agent = session["agent"]
         if agent is None:
             session["running"] = False
+            session.pop("_turn_attached_documents", None)
         else:
+            if consume_live:
+                session["attached_images"] = []
+                session["attached_documents"] = []
+            session["_turn_attached_documents"] = turn_docs
             with contextlib.suppress(Exception):
                 agent.clear_interrupt()
     if agent is None:
@@ -259,16 +257,19 @@ def _route_turn_documents(agent, run_message: Any, docs: list[dict[str, str]]) -
     import base64 as _b64
     from pathlib import Path as _Path
     try:
-        from agent.image_routing import decide_pdf_input_mode, supports_pdf_in_tool_results
+        from agent.image_routing import decide_pdf_input_mode, supports_pdf_in_user_turns
         from hermes_cli.config import load_config as _tui_load_config
         _provider, _model = _active_image_routing_identity(agent)
+        _base_url = getattr(agent, "base_url", "") or ""
+        _api_mode = getattr(agent, "api_mode", "") or ""
         cfg = _tui_load_config()
         native_ok = (
-            supports_pdf_in_tool_results(_provider, _model, cfg, base_url=getattr(agent, "base_url", ""))
+            supports_pdf_in_user_turns(_provider, _model, cfg, base_url=_base_url, api_mode=_api_mode)
             and decide_pdf_input_mode(
                 _provider, _model, cfg,
                 requested_provider=getattr(agent, "requested_provider", ""),
                 allow_network=False,
+                base_url=_base_url,
             ) == "native"
         )
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
@@ -797,7 +798,8 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
         prompt = ctx.message
     st.prompt_text = prompt if isinstance(prompt, str) else ""
     run_message: Any = _route_turn_images(agent, prompt, images) if images else prompt
-    docs = list(session.pop("_turn_attached_documents", []))
+    with session["history_lock"]:
+        docs = list(session.pop("_turn_attached_documents", []))
     if docs:
         run_message = _route_turn_documents(agent, run_message, docs)
     from agent.notification_presentation import event_presentation_muted

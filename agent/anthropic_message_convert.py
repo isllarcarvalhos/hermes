@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
 _CACHEABLE_TYPES = frozenset(("text", "tool_use"))
 _EMPTY_TEXT_PLACEHOLDER = "(empty)"
+_STRICT_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _EMPTY_SCHEMA = {"type": "object", "properties": {}}
 _BEDROCK_REGION_PREFIXES = ("global.", "us.", "eu.", "apac.", "ap.", "au.", "jp.", "ca.", "sa.", "me.", "af.")
 
@@ -212,7 +213,7 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[dict[str, Any]]:
         mime = str(part.get("mime_type") or part.get("media_type") or "").strip().lower()
         raw_data = part.get("data")
         cleaned = "".join(raw_data.split()) if isinstance(raw_data, str) else ""
-        if mime == "application/pdf" and cleaned:
+        if mime == "application/pdf" and cleaned and len(cleaned) % 4 == 0 and _STRICT_BASE64_RE.fullmatch(cleaned):
             block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": cleaned}}
         else:
             block = _text_block("[document omitted — unsupported by Anthropic]")

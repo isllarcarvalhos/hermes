@@ -1100,17 +1100,18 @@ def _session_supports_native_pdf(session: dict) -> bool:
     if agent is None:
         return False
     try:
-        from agent.image_routing import decide_pdf_input_mode, supports_pdf_in_tool_results
+        from agent.image_routing import decide_pdf_input_mode, supports_pdf_in_user_turns
         from hermes_cli.config import load_config as _tui_load_config
         provider = str(getattr(agent, "provider", "") or "").strip()
         model = str(getattr(agent, "model", "") or "").strip()
         base_url = str(getattr(agent, "base_url", "") or "").strip()
         requested_provider = str(getattr(agent, "requested_provider", "") or "").strip()
+        api_mode = str(getattr(agent, "api_mode", "") or "").strip()
         cfg = _tui_load_config()
         return (
-            supports_pdf_in_tool_results(provider, model, cfg, base_url=base_url)
+            supports_pdf_in_user_turns(provider, model, cfg, base_url=base_url, api_mode=api_mode)
             and decide_pdf_input_mode(
-                provider, model, cfg, requested_provider=requested_provider, allow_network=False,
+                provider, model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
             ) == "native"
         )
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
@@ -1158,6 +1159,7 @@ def _(rid, params: dict) -> dict:
                 return _ok(rid, {
                     "attached": True,
                     "native_document": True,
+                    "path": str(stored_path),
                     "filename": display_name,
                     "pages_attached": 0,
                     "pages": [],
@@ -1199,7 +1201,7 @@ def _(rid, params: dict) -> dict:
             attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
         return _ok(rid, {
             "attached": True, "filename": display_name, "pages_attached": len(attached_pages),
-            "pages": attached_pages, "count": len(session["attached_images"]),
+            "pages": attached_pages, "count": len(session["attached_images"]) + len(session.get("attached_documents", [])),
             "text": f"[User attached PDF: {display_name} ({len(attached_pages)} page(s))]"})
 
 
@@ -1263,7 +1265,7 @@ def _(rid, params: dict) -> dict:
             session.setdefault("attached_images", []).append(str(drop_path))
             return _ok(rid, {
                 "matched": True, "is_image": True, "path": str(drop_path),
-                "count": len(session["attached_images"]),
+                "count": len(session["attached_images"]) + len(session.get("attached_documents", [])),
                 "text": remainder or f"[User attached image: {drop_path.name}]",
                 **_image_meta(drop_path)})
         text = f"[User attached file: {drop_path}]" + (f"\n{remainder}" if remainder else "")
@@ -1447,7 +1449,8 @@ def _(rid, params: dict) -> dict:
 def _attached_image_result(session, image_path, **extra) -> dict:
     """Common ``{attached, path, count, ...meta}`` reply after queuing an image."""
     return {
-        "attached": True, "path": str(image_path), "count": len(session["attached_images"]),
+        "attached": True, "path": str(image_path),
+        "count": len(session["attached_images"]) + len(session.get("attached_documents", [])),
         **extra, **_image_meta(image_path)}
 
 

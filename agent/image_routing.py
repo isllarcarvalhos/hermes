@@ -554,6 +554,7 @@ def _lookup_supports_audio(
     *,
     requested_provider: str = "",
     allow_network: bool = True,
+    base_url: str = "",
 ) -> Optional[bool]:
     """Return True/False when audio input capability is known, None if unknown."""
     verdict = _lookup_modality_capability(
@@ -561,7 +562,7 @@ def _lookup_supports_audio(
         override_key="supports_audio", override_alias="audio",
         requested_provider=requested_provider, allow_network=allow_network,
     )
-    if verdict is None and is_native_gemini_video_route(provider, model, cfg):
+    if verdict is None and _is_native_gemini_user_media_route(provider, model, cfg, base_url=base_url):
         return True
     return verdict
 
@@ -573,6 +574,7 @@ def _lookup_supports_pdf(
     *,
     requested_provider: str = "",
     allow_network: bool = True,
+    base_url: str = "",
 ) -> Optional[bool]:
     """Return True/False when native PDF input capability is known, None if unknown."""
     verdict = _lookup_modality_capability(
@@ -580,7 +582,10 @@ def _lookup_supports_pdf(
         override_key="supports_pdf", override_alias="pdf",
         requested_provider=requested_provider, allow_network=allow_network,
     )
-    if verdict is None and is_native_gemini_video_route(provider, model, cfg):
+    if verdict is None and (
+        _is_native_gemini_user_media_route(provider, model, cfg, base_url=base_url)
+        or _clean_str(provider).lower() == "anthropic"
+    ):
         return True
     return verdict
 
@@ -657,6 +662,55 @@ def supports_video_in_tool_results(
     return is_native_gemini_video_route(provider, model, cfg, base_url=base_url)
 
 
+def _is_native_gemini_user_media_route(
+    provider: str,
+    model: str,
+    cfg: Optional[dict[str, Any]] = None,
+    *,
+    base_url: str = "",
+) -> bool:
+    """True when the route speaks native Gemini REST/Interactions for user-turn media (including Gemini 2.5+)."""
+    p = _clean_str(provider).lower()
+    m = _clean_str(model)
+    if not p or not m:
+        return False
+    if p == "solstice":
+        return True
+    from agent.gemini_native_adapter import is_native_gemini_base_url
+    resolved_url = _provider_base_url_for_video_route(cfg, p, base_url=base_url)
+    if resolved_url:
+        if resolved_url.rstrip("/").lower().endswith("/v1"):
+            return False
+        return is_native_gemini_base_url(resolved_url)
+    return p in _GEMINI_NATIVE_VIDEO_PROVIDERS
+
+
+def supports_audio_in_user_turns(
+    provider: str,
+    model: str,
+    cfg: Optional[dict[str, Any]] = None,
+    *,
+    base_url: str = "",
+) -> bool:
+    """Whether provider+model accepts native audio inside user-turn messages."""
+    return _is_native_gemini_user_media_route(provider, model, cfg, base_url=base_url)
+
+
+def supports_pdf_in_user_turns(
+    provider: str,
+    model: str,
+    cfg: Optional[dict[str, Any]] = None,
+    *,
+    base_url: str = "",
+    api_mode: str = "",
+) -> bool:
+    """Whether provider+model accepts native PDF documents inside user-turn messages."""
+    p = _clean_str(provider).lower()
+    if api_mode == "anthropic_messages" or p == "anthropic":
+        return bool(_clean_str(model))
+    return _is_native_gemini_user_media_route(provider, model, cfg, base_url=base_url)
+
+
 def supports_audio_in_tool_results(
     provider: str,
     model: str,
@@ -704,13 +758,18 @@ def decide_audio_input_mode(
     *,
     requested_provider: str = "",
     allow_network: bool = True,
+    base_url: str = "",
 ) -> str:
     """Return ``"native"`` or ``"auxiliary"`` for audio input routing."""
     mode_cfg = _coerce_audio_mode(_dict_or_empty(_dict_or_empty(cfg).get("agent")).get("audio_input_mode"))
     if mode_cfg != "auto":
         return mode_cfg
     extra = {"requested_provider": requested_provider} if requested_provider else {}
-    return "native" if _lookup_supports_audio(provider, model, cfg, allow_network=allow_network, **extra) is True else "auxiliary"
+    return (
+        "native"
+        if _lookup_supports_audio(provider, model, cfg, allow_network=allow_network, base_url=base_url, **extra) is True
+        else "auxiliary"
+    )
 
 
 def decide_pdf_input_mode(
@@ -720,13 +779,18 @@ def decide_pdf_input_mode(
     *,
     requested_provider: str = "",
     allow_network: bool = True,
+    base_url: str = "",
 ) -> str:
     """Return ``"native"`` or ``"text"`` for PDF document routing."""
     mode_cfg = _coerce_pdf_mode(_dict_or_empty(_dict_or_empty(cfg).get("agent")).get("pdf_input_mode"))
     if mode_cfg != "auto":
         return mode_cfg
     extra = {"requested_provider": requested_provider} if requested_provider else {}
-    return "native" if _lookup_supports_pdf(provider, model, cfg, allow_network=allow_network, **extra) is True else "text"
+    return (
+        "native"
+        if _lookup_supports_pdf(provider, model, cfg, allow_network=allow_network, base_url=base_url, **extra) is True
+        else "text"
+    )
 
 
 # Image size handling is REACTIVE: attach at full size and let

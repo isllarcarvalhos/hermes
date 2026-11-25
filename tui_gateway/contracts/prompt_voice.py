@@ -163,6 +163,7 @@ class PdfAttachResult(Result):
     count: int
     text: str
     native_document: bool | None = None
+    path: str | None = None
 
 
 method("pdf.attach", params=PdfAttachParams, result=PdfAttachResult,

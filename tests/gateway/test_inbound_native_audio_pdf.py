@@ -61,6 +61,21 @@ def test_gateway_inbound_native_audio_pdf_auto_and_spoof_rejection(tmp_path: Pat
         assert rem_audio_ds == [str(wav_path)]
         assert native_pdfs_ds == set()
 
+        # Anthropic user-turn PDFs and Gemini 2.5 user-turn audio+PDFs route natively
+        ant = _FakeRunner("anthropic", "claude-sonnet-4-5")
+        rem_audio_ant, native_pdfs_ant = ant._route_inbound_native_audio_and_pdfs(
+            event, None, "s3", [str(wav_path)]
+        )
+        assert rem_audio_ant == [str(wav_path)]
+        assert native_pdfs_ant == {str(pdf_path)}
+
+        g25 = _FakeRunner("gemini", "gemini-2.5-pro")
+        rem_audio_25, native_pdfs_25 = g25._route_inbound_native_audio_and_pdfs(
+            event, None, "s4", [str(wav_path)]
+        )
+        assert rem_audio_25 == []
+        assert native_pdfs_25 == {str(pdf_path)}
+
 
 def test_turn_runner_native_media_materialization(tmp_path: Path):
     pdf_path = tmp_path / "doc.pdf"
@@ -82,3 +97,15 @@ def test_turn_runner_native_media_materialization(tmp_path: Path):
     assert isinstance(out, list) and len(out) == 3
     assert out[1]["type"] == "audio" and out[1]["mime_type"] == "audio/wav"
     assert out[2]["type"] == "document" and out[2]["filename"] == "doc.pdf"
+
+    # Missing file at materialization time emits a fallback path note instead of silently vanishing
+    missing_runner = SimpleNamespace(
+        _consume_pending_native_image_paths=lambda sid: [],
+        _consume_pending_native_media_attachments=lambda sid: [
+            {"kind": "document", "path": str(tmp_path / "gone.pdf"), "mime_type": "application/pdf", "filename": "gone.pdf"},
+        ],
+    )
+    tr._runner = missing_runner
+    tr._ctx = SimpleNamespace(session_key="s1", message="Summarize")
+    fb = tr._native_image_run_message()
+    assert isinstance(fb, str) and "gone.pdf" in fb and "Summarize" in fb

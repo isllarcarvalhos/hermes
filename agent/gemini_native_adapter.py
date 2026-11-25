@@ -373,15 +373,23 @@ def _inline_data_part(item: dict[str, Any]) -> Optional[dict[str, Any]]:
             if isinstance(raw_data, str) and mime:
                 cleaned = _clean_strict_base64(raw_data)
                 return {"inlineData": {"mimeType": mime, "data": cleaned}} if cleaned else None
-    # Direct {type: "audio"|"document", mime_type: ..., data: <raw_b64>} shape
-    if part_type in ("audio", "document") and isinstance(item.get("data"), str):
-        mime = str(item.get("mime_type") or item.get("media_type") or "").strip().lower()
-        if part_type == "audio":
-            mime = normalize_audio_mime(mime)
-        allowed = mime.startswith("audio/") if part_type == "audio" else (mime in _DOCUMENT_INLINE_MIMES)
-        if allowed:
-            cleaned = _clean_strict_base64(item["data"])
-            return {"inlineData": {"mimeType": mime, "data": cleaned}} if cleaned else None
+    # Direct {type: "audio"|"document", mime_type: ..., data: <raw_b64>} or Anthropic document source shape
+    if part_type in ("audio", "document"):
+        if isinstance(item.get("data"), str):
+            mime = str(item.get("mime_type") or item.get("media_type") or "").strip().lower()
+            raw_b64 = item["data"]
+        elif part_type == "document" and isinstance(src := item.get("source"), dict) and src.get("type") == "base64" and isinstance(src.get("data"), str):
+            mime = str(src.get("media_type") or src.get("mime_type") or "").strip().lower()
+            raw_b64 = src["data"]
+        else:
+            mime, raw_b64 = "", ""
+        if raw_b64:
+            if part_type == "audio":
+                mime = normalize_audio_mime(mime)
+            allowed = mime.startswith("audio/") if part_type == "audio" else (mime in _DOCUMENT_INLINE_MIMES)
+            if allowed:
+                cleaned = _clean_strict_base64(raw_b64)
+                return {"inlineData": {"mimeType": mime, "data": cleaned}} if cleaned else None
     # OpenAI file / input_file shape: {"type": "file", "file": {"file_data": "data:application/pdf;base64,..."}}
     if part_type in ("file", "input_file"):
         fobj = item.get("file") if isinstance(item.get("file"), dict) else item

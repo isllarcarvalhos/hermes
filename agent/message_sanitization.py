@@ -367,7 +367,11 @@ def serialized_messages_bytes(messages: list) -> int:
 
 
 def _strip_media_types_from_messages(
-    messages: list, media_types: frozenset[str], *, label: str = "media",
+    messages: list,
+    media_types: frozenset[str],
+    *,
+    label: str = "media",
+    preserve_empty_user: bool = False,
 ) -> bool:
     """Remove specified media content parts from all messages in-place."""
     from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -386,7 +390,7 @@ def _strip_media_types_from_messages(
                 msg["content"] = new_parts
                 # Rewriting a stamped live dict stales its persisted row; pop the marker.
                 msg.pop(_DB_PERSISTED_MARKER, None)
-            elif msg.get("role") == "tool" or msg.get("tool_calls"):
+            elif msg.get("role") == "tool" or msg.get("tool_calls") or (preserve_empty_user and msg.get("role") == "user"):
                 msg["content"] = f"[{label} content removed — server does not support {label} input]"
                 msg.pop(_DB_PERSISTED_MARKER, None)
             else:
@@ -504,9 +508,13 @@ def strip_images_for_rejecting_model(agent: Any, api_messages: Any) -> bool:
         return False
     stripped = False
     if "audio" in mods:
-        stripped |= _strip_media_types_from_messages(api_messages, _AUDIO_PART_TYPES, label="audio")
+        stripped |= _strip_media_types_from_messages(
+            api_messages, _AUDIO_PART_TYPES, label="audio", preserve_empty_user=True,
+        )
     if "document" in mods:
-        stripped |= _strip_media_types_from_messages(api_messages, _DOCUMENT_PART_TYPES, label="document")
+        stripped |= _strip_media_types_from_messages(
+            api_messages, _DOCUMENT_PART_TYPES, label="document", preserve_empty_user=True,
+        )
     return stripped
 
 

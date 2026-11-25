@@ -23,7 +23,12 @@ import httpx
 
 from agent.errors import EmptyStreamError
 from agent.tool_history_as_text import tool_history_for_request
-from session_rules.turns import _durable_content
+from session_rules.turns import (
+    _AUDIO_PART_TYPES,
+    _DOCUMENT_PART_TYPES,
+    _VIDEO_PART_TYPES,
+    _durable_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -755,8 +760,12 @@ def _convert_content_to_converse(content) -> list[dict]:
             image_url = part.get("image_url", {})
             url = image_url.get("url", "") if isinstance(image_url, dict) else ""
             blocks.append(_image_block_from_data_url(url) if url.startswith("data:") else {"text": f"[Image: {url}]"})
-        elif isinstance(part, dict) and part.get("type", "") in ("video_url", "input_video", "video"):
+        elif isinstance(part, dict) and part.get("type", "") in _VIDEO_PART_TYPES:
             blocks.append({"text": "[Video attached earlier in this conversation — omitted because Bedrock Converse does not support inline video blocks.]"})
+        elif isinstance(part, dict) and part.get("type", "") in _AUDIO_PART_TYPES:
+            blocks.append({"text": "[Audio attached earlier in this conversation — omitted because Bedrock Converse does not support inline audio blocks.]"})
+        elif isinstance(part, dict) and part.get("type", "") in _DOCUMENT_PART_TYPES:
+            blocks.append({"text": "[Document attached earlier in this conversation — omitted because Bedrock Converse does not support inline document blocks.]"})
     return blocks or [dict(_PLACEHOLDER_BLOCK)]
 
 

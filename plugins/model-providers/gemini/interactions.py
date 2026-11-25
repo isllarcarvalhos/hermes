@@ -236,10 +236,17 @@ def _document_content(item: dict[str, Any]) -> Optional[dict[str, Any]]:
     part_type = item.get("type")
     if part_type not in _DOCUMENT_PART_TYPES:
         return None
-    if part_type == "document" and isinstance(item.get("data"), str):
-        mime = str(item.get("mime_type") or item.get("media_type") or "").strip().lower()
-        if mime in _DOCUMENT_MIME_TYPES:
-            cleaned = _clean_strict_b64(item["data"])
+    if part_type == "document":
+        if isinstance(item.get("data"), str):
+            mime = str(item.get("mime_type") or item.get("media_type") or "").strip().lower()
+            raw_b64 = item["data"]
+        elif isinstance(src := item.get("source"), dict) and src.get("type") == "base64" and isinstance(src.get("data"), str):
+            mime = str(src.get("media_type") or src.get("mime_type") or "").strip().lower()
+            raw_b64 = src["data"]
+        else:
+            mime, raw_b64 = "", ""
+        if raw_b64 and mime in _DOCUMENT_MIME_TYPES:
+            cleaned = _clean_strict_b64(raw_b64)
             return {"type": "document", "mime_type": mime, "data": cleaned} if cleaned else None
     if part_type in ("file", "input_file"):
         fobj = item.get("file") if isinstance(item.get("file"), dict) else item

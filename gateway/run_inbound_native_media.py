@@ -10,8 +10,8 @@ from typing import Any
 from agent.image_routing import (
     decide_audio_input_mode,
     decide_pdf_input_mode,
-    supports_audio_in_tool_results,
-    supports_pdf_in_tool_results,
+    supports_audio_in_user_turns,
+    supports_pdf_in_user_turns,
 )
 from hermes_cli.config import load_config
 from tools.media_io import (
@@ -26,16 +26,16 @@ from tools.media_io import (
 logger = logging.getLogger(__name__)
 
 
-def route_inbound_native_audio_and_pdfs(
+def prepare_inbound_native_audio_and_pdfs(
     runner: Any,
     event: Any,
     source: Any,
     session_key: str,
     audio_file_paths: list[str],
-) -> tuple[list[str], set[str]]:
-    """Queue eligible inbound audio files and PDFs for native attachment.
+) -> tuple[list[str], set[str], list[dict[str, str]]]:
+    """Identify eligible inbound audio files and PDFs for native attachment without mutating session state.
 
-    Returns ``(remaining_audio_file_paths, native_pdf_paths)``. Never touches ``MessageType.VOICE`` STT.
+    Returns ``(remaining_audio_file_paths, native_pdf_paths, queued_attachments)``. Never touches ``MessageType.VOICE`` STT.
     """
     try:
         turn_model, runtime_kwargs = runner._resolve_session_agent_runtime(
@@ -45,27 +45,28 @@ def route_inbound_native_audio_and_pdfs(
         provider = str(rt.get("provider") or "").strip()
         base_url = str(rt.get("base_url") or "").strip()
         requested_provider = str(rt.get("requested_provider") or provider).strip()
+        api_mode = str(rt.get("api_mode") or "").strip()
         cfg = load_config()
         audio_native = (
             bool(audio_file_paths)
-            and supports_audio_in_tool_results(provider, turn_model, cfg, base_url=base_url)
+            and supports_audio_in_user_turns(provider, turn_model, cfg, base_url=base_url)
             and decide_audio_input_mode(
-                provider, turn_model, cfg, requested_provider=requested_provider, allow_network=False,
+                provider, turn_model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
             ) == "native"
         )
         pdf_native = (
             bool(event.media_urls)
-            and supports_pdf_in_tool_results(provider, turn_model, cfg, base_url=base_url)
+            and supports_pdf_in_user_turns(provider, turn_model, cfg, base_url=base_url, api_mode=api_mode)
             and decide_pdf_input_mode(
-                provider, turn_model, cfg, requested_provider=requested_provider, allow_network=False,
+                provider, turn_model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
             ) == "native"
         )
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         logger.debug("gateway native audio/PDF capability probe failed: %s", exc)
-        return audio_file_paths, set()
+        return audio_file_paths, set(), []
 
     if not (audio_native or pdf_native):
-        return audio_file_paths, set()
+        return audio_file_paths, set(), []
 
     queued: list[dict[str, str]] = []
     remaining_audio: list[str] = []
@@ -105,27 +106,51 @@ def route_inbound_native_audio_and_pdfs(
             queued.append({"kind": "document", "path": path, "mime_type": "application/pdf", "filename": display})
             native_pdf_paths.add(path)
 
+    return remaining_audio, native_pdf_paths, queued
+
+
+def route_inbound_native_audio_and_pdfs(
+    runner: Any,
+    event: Any,
+    source: Any,
+    session_key: str,
+    audio_file_paths: list[str],
+) -> tuple[list[str], set[str]]:
+    """Queue eligible inbound audio files and PDFs for native attachment.
+
+    Returns ``(remaining_audio_file_paths, native_pdf_paths)``. Never touches ``MessageType.VOICE`` STT.
+    """
+    remaining_audio, native_pdf_paths, queued = prepare_inbound_native_audio_and_pdfs(
+        runner, event, source, session_key, audio_file_paths,
+    )
     if queued:
         runner._session_state(session_key).persistent.native_media_attachments = queued
     return remaining_audio, native_pdf_paths
 
 
-def materialize_native_media_parts(items: list[dict[str, str]]) -> list[dict[str, Any]]:
-    """Build outbound ``audio``/``document`` content parts from queued gateway attachment records."""
+def materialize_native_media_parts_with_skipped(
+    items: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Build outbound ``audio``/``document`` content parts from queued gateway records, returning ``(parts, skipped)``."""
     parts: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
     for item in items:
         raw_path = str(item.get("path") or "")
         kind = str(item.get("kind") or "")
         mime_type = str(item.get("mime_type") or "")
         filename = str(item.get("filename") or os.path.basename(raw_path))
         if not raw_path or kind not in ("audio", "document"):
+            skipped.append(item)
             continue
         raw = read_file_bounded_nofollow(raw_path, max_bytes=MAX_NATIVE_MEDIA_RAW_BYTES)
         if raw is None:
+            skipped.append(item)
             continue
         if kind == "audio" and not is_valid_audio_bytes(raw):
+            skipped.append(item)
             continue
         if kind == "document" and mime_type == "application/pdf" and not is_valid_pdf_bytes(raw):
+            skipped.append(item)
             continue
         encoded = base64.b64encode(raw).decode("ascii")
         if kind == "audio":
@@ -137,4 +162,10 @@ def materialize_native_media_parts(items: list[dict[str, str]]) -> list[dict[str
                 "data": encoded,
                 "filename": filename,
             })
+    return parts, skipped
+
+
+def materialize_native_media_parts(items: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """Build outbound ``audio``/``document`` content parts from queued gateway attachment records."""
+    parts, _ = materialize_native_media_parts_with_skipped(items)
     return parts

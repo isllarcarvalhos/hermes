@@ -66,20 +66,41 @@ def test_pdf_attach_rpc_contract_and_profile_scoped_routing(monkeypatch, tmp_pat
         validated = PdfAttachResult.model_validate(resp["result"])
         assert validated.attached is True
         assert validated.native_document is True
+        assert validated.path == session["attached_documents"][0]["path"]
         assert validated.filename == "quarterly.pdf"
         assert validated.pages_attached == 0
         assert validated.count == 1
         assert len(session["attached_documents"]) == 1
-        assert Path(session["attached_documents"][0]["path"]).name.startswith("quarterly")
+        assert Path(validated.path).name.startswith("quarterly")
 
-        # image.detach removes the staged PDF and reports combined count=0
+        # image.detach removes the staged PDF using the path returned by pdf.attach and reports combined count=0
         detach_resp = server.handle_request({
             "id": "2",
             "method": "image.detach",
-            "params": {"session_id": sid, "path": session["attached_documents"][0]["path"]},
+            "params": {"session_id": sid, "path": validated.path},
         })
         assert detach_resp["result"] == {"detached": True, "count": 0}
         assert session["attached_documents"] == []
+
+        # Anthropic & Gemini 2.5 user turns also support native pdf.attach without pdftoppm
+        for extra_sid, prov, mod, mode in (
+            ("pdf-anthropic-test", "anthropic", "claude-sonnet-4-5", "anthropic_messages"),
+            ("pdf-gemini25-test", "gemini", "gemini-2.5-pro", "chat_completions"),
+        ):
+            s_extra = _make_session(secondary_home, extra_sid, provider=prov, model=mod)
+            s_extra["agent"].api_mode = mode
+            server._sessions[extra_sid] = s_extra
+            try:
+                r_extra = server.handle_request({
+                    "id": extra_sid,
+                    "method": "pdf.attach",
+                    "params": {"session_id": extra_sid, "content_base64": _TINY_PDF_B64, "filename": "brief.pdf"},
+                })
+                assert "result" in r_extra, r_extra
+                v_extra = PdfAttachResult.model_validate(r_extra["result"])
+                assert v_extra.native_document is True and v_extra.path
+            finally:
+                server._sessions.pop(extra_sid, None)
     finally:
         server._sessions.pop(sid, None)
 
@@ -146,3 +167,47 @@ def test_route_turn_documents_and_history_projection(tmp_path: Path):
         image_urls=False,
     )
     assert rendered.strip() == "[document: a.pdf]"
+
+
+def test_queued_turn_attachment_isolation_in_admit_and_compute_host(tmp_path: Path, monkeypatch):
+    session = _make_session(tmp_path, "s-iso", provider="solstice", model="gemini-4-neon")
+    session["agent"].clear_interrupt = lambda: None
+    live_img = str(tmp_path / "live.png")
+    live_doc = {"path": str(tmp_path / "live.pdf"), "filename": "live.pdf", "mime_type": "application/pdf"}
+    queued_doc = {"path": str(tmp_path / "queued.pdf"), "filename": "queued.pdf", "mime_type": "application/pdf"}
+    session["attached_images"] = [live_img]
+    session["attached_documents"] = [live_doc]
+
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda _sid, _sess: None)
+
+    # 1. Queued PDF-only turn must NOT steal live composer images in _admit_prompt_turn
+    admitted = server._admit_prompt_turn(
+        "s-iso", session, "queued pdf", None, None, None, None, attached_documents=[queued_doc],
+    )
+    assert admitted is not None
+    images, _agent = admitted
+    assert images == []
+    assert session["_turn_attached_documents"] == [queued_doc]
+    assert session["attached_images"] == [live_img]
+    assert session["attached_documents"] == [live_doc]
+
+    # 2. Compute-host turn frame: queued PDF-only does not steal live images, queued image-only does not steal live docs
+    frame_pdf = server._compute_host_turn_frame(
+        "r1", "s-iso", session, "queued pdf", image_paths=None, attached_documents=[queued_doc],
+    )
+    assert frame_pdf["attached_images"] == []
+    assert frame_pdf["attached_documents"] == [queued_doc]
+
+    frame_img = server._compute_host_turn_frame(
+        "r2", "s-iso", session, "queued img", image_paths=[str(tmp_path / "q.png")], attached_documents=None,
+    )
+    assert frame_img["attached_images"] == [str(tmp_path / "q.png")]
+    assert frame_img["attached_documents"] == []
+
+    # 3. agent=None refusal must neither wipe live composer docs nor leave stale _turn_attached_documents
+    session["agent"] = None
+    monkeypatch.setattr(server, "_emit_terminal_turn_error", lambda *a, **k: None)
+    assert server._admit_prompt_turn("s-iso", session, "hi", None, None, None, None) is None
+    assert "_turn_attached_documents" not in session
+    assert session["attached_documents"] == [live_doc]
+    assert session["attached_images"] == [live_img]
