@@ -191,6 +191,7 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[dict[str, Any]]:
     if not isinstance(part, dict):
         return _text_block(part if isinstance(part, str) else str(part))
     ptype = part.get("type")
+    block: dict[str, Any]
     if ptype in ("input_text", "text"):
         # Rebuild from whitelisted fields only: stored SDK text blocks carry output-only siblings
         # (parsed_output, citations=None) that the INPUT schema rejects with 400.
@@ -199,6 +200,22 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[dict[str, Any]]:
         image_value = part.get("image_url", {})
         url = image_value.get("url", "") if isinstance(image_value, dict) else str(image_value or "")
         block = _image_block_from_openai_url(url)
+    elif ptype in {"audio", "audio_url", "input_audio"}:
+        block = _text_block("[audio omitted — unsupported by Anthropic]")
+    elif ptype in {"video", "video_url", "input_video"}:
+        block = _text_block("[video omitted — unsupported by Anthropic]")
+    elif ptype in {"document_url", "file", "input_file"}:
+        block = _text_block("[document omitted — unsupported by Anthropic]")
+    elif ptype == "document" and not isinstance(part.get("source"), dict):
+        # Raw Interactions/Gemini document shape ({type: "document", mime_type, data}); convert PDF to Anthropic's
+        # native document source or downgrade non-PDF to a safe text marker so Anthropic never 400s.
+        mime = str(part.get("mime_type") or part.get("media_type") or "").strip().lower()
+        raw_data = part.get("data")
+        cleaned = "".join(raw_data.split()) if isinstance(raw_data, str) else ""
+        if mime == "application/pdf" and cleaned:
+            block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": cleaned}}
+        else:
+            block = _text_block("[document omitted — unsupported by Anthropic]")
     else:
         block = dict(part)
     if (cache_control := _cache_control_of(part)) is not None:

@@ -23,6 +23,7 @@ import httpx
 
 from agent.errors import EmptyStreamError
 from agent.tool_history_as_text import tool_history_for_request
+from session_rules.turns import _durable_content
 
 logger = logging.getLogger(__name__)
 
@@ -1027,7 +1028,12 @@ def convert_messages_to_converse(
         if role == "system":
             system_blocks.extend(_system_blocks(content))
         elif role == "tool":
-            result_content = content if isinstance(content, str) else json.dumps(content)
+            if isinstance(content, str):
+                result_content = content
+            elif isinstance(content, list):
+                result_content = _durable_content(content) or ""
+            else:
+                result_content = json.dumps(content)
             append_turn("user", [{"toolResult": {
                 "toolUseId": msg.get("tool_call_id", ""), "content": [{"text": _safe_text(result_content)}]}}])
         elif role == "assistant":

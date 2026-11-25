@@ -109,6 +109,25 @@ class ModelCapabilities:
     context_window: int = 200000
     max_output_tokens: Optional[int] = None
     model_family: str = ""
+    input_modalities: Optional[frozenset[str]] = None
+
+    def supports_modality(self, modality: str) -> Optional[bool]:
+        """Tri-state check for an input modality token (``image``, ``video``, ``audio``, ``pdf``)."""
+        if modality == "image" and self.supports_vision is not None:
+            return self.supports_vision
+        if modality == "video" and self.supports_video is not None:
+            return self.supports_video
+        if self.input_modalities is None:
+            return None
+        return modality in self.input_modalities
+
+    @property
+    def supports_audio(self) -> Optional[bool]:
+        return self.supports_modality("audio")
+
+    @property
+    def supports_pdf(self) -> Optional[bool]:
+        return self.supports_modality("pdf")
 
 
 # Hermes provider names → models.dev provider IDs
@@ -810,11 +829,33 @@ def _default_override_context(provider: str) -> Optional[int]:
     return _override_int(default, "context_window") if default is not None else None
 
 
+_MODALITY_OVERRIDE_TOKENS: tuple[tuple[str, str], ...] = (
+    ("supports_vision", "image"),
+    ("supports_video", "video"),
+    ("supports_audio", "audio"),
+    ("supports_pdf", "pdf"),
+)
+
+
+def _coerce_override_bool(raw: Any) -> Optional[bool]:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ("true", "yes", "on", "1"):
+            return True
+        if low in ("false", "no", "off", "0"):
+            return False
+    return None
+
+
 def _override_to_catalog_shape(
     override: dict[str, Any],
-) -> tuple[dict[str, Any], Optional[bool], Optional[bool]]:
-    """Translate canonical override keys into a models.dev-shaped patch. Returns ``(patch, vision, video)`` —
-    vision/video are out-of-band because they map onto the ``modalities.input`` list rather than scalar fields."""
+) -> tuple[dict[str, Any], dict[str, bool]]:
+    """Translate canonical override keys into a models.dev-shaped patch. Returns ``(patch, modality_flags)`` —
+    modality flags are out-of-band because they map onto the ``modalities.input`` list rather than scalar fields."""
     patch: dict[str, Any] = {}
     limit = {
         catalog_key: value for catalog_key, override_key in (("context", "context_window"),)
@@ -825,36 +866,34 @@ def _override_to_catalog_shape(
     for override_key, catalog_key in (("supports_tools", "tool_call"), ("supports_reasoning", "reasoning")):
         if override_key in override:
             patch[catalog_key] = bool(override[override_key])
-    vision: Optional[bool] = None
+    modality_flags: dict[str, bool] = {}
     if "supports_vision" in override:
-        vision = patch["attachment"] = bool(override["supports_vision"])
-    video: Optional[bool] = None
-    if "supports_video" in override:
-        raw_video = override["supports_video"]
-        if isinstance(raw_video, bool):
-            video = raw_video
-        elif isinstance(raw_video, int) and raw_video in (0, 1):
-            video = bool(raw_video)
-        elif isinstance(raw_video, str) and raw_video.strip().lower() in ("true", "yes", "on", "1", "false", "no", "off", "0"):
-            video = raw_video.strip().lower() in ("true", "yes", "on", "1")
+        vision_flag = bool(override["supports_vision"])
+        patch["attachment"] = vision_flag
+        modality_flags["image"] = vision_flag
+    for override_key, token in _MODALITY_OVERRIDE_TOKENS[1:]:
+        if override_key in override:
+            coerced = _coerce_override_bool(override[override_key])
+            if coerced is not None:
+                modality_flags[token] = coerced
     if "model_family" in override:
         patch["family"] = str(override["model_family"] or "")
-    return patch, vision, video
+    return patch, modality_flags
 
 
 def _merge_catalog_entry_with_override(raw: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Patch a catalog entry with a canonical-schema override. Sub-dicts (``limit``, ``modalities``) are
     merged, not clobbered — setting only ``context_window`` must not wipe the catalog's ``limit.output``."""
-    shaped, vision_override, video_override = _override_to_catalog_shape(override)
+    shaped, modality_flags = _override_to_catalog_shape(override)
     merged = dict(raw)
     limit_patch = shaped.pop("limit", None)
     if limit_patch:
         merged["limit"] = {**_dict_or_empty(raw.get("limit")), **limit_patch}
-    if vision_override is not None or video_override is not None:
+    if modality_flags:
         base_mods = dict(_dict_or_empty(raw.get("modalities")))
         input_mods = base_mods.get("input")
         input_mods = list(input_mods) if isinstance(input_mods, list) else []
-        for flag, token in ((vision_override, "image"), (video_override, "video")):
+        for token, flag in modality_flags.items():
             if flag is True and token not in input_mods:
                 input_mods.append(token)
             elif flag is False and token in input_mods:
@@ -920,10 +959,18 @@ def _entry_supports_vision(entry: dict[str, Any]) -> bool:
     return "image" in input_mods if isinstance(input_mods, list) else bool(entry.get("attachment", False))
 
 
+def _entry_input_modalities(entry: dict[str, Any]) -> Optional[frozenset[str]]:
+    """Declared ``modalities.input`` tokens as a frozenset; None when absent/invalid."""
+    input_mods = _dict_or_empty(entry.get("modalities", {})).get("input")
+    if not isinstance(input_mods, list):
+        return None
+    return frozenset(str(m).strip().lower() for m in input_mods if isinstance(m, str) and m.strip())
+
+
 def _entry_supports_video(entry: dict[str, Any]) -> Optional[bool]:
     """True/False when ``modalities.input`` is explicitly declared; None when absent."""
-    input_mods = _dict_or_empty(entry.get("modalities", {})).get("input")
-    return "video" in input_mods if isinstance(input_mods, list) else None
+    mods = _entry_input_modalities(entry)
+    return None if mods is None else ("video" in mods)
 
 
 def get_model_capabilities(
@@ -947,6 +994,7 @@ def get_model_capabilities(
     raw = _apply_overrides(provider, model, entry, config=config)
     if raw is None:
         return None
+    input_mods = None if unknown_base and "modalities" not in raw else _entry_input_modalities(raw)
     return ModelCapabilities(
         supports_tools=bool(raw.get("tool_call", False)),
         supports_vision=(
@@ -954,11 +1002,12 @@ def get_model_capabilities(
             if unknown_base and "attachment" not in raw and "modalities" not in raw
             else _entry_supports_vision(raw)
         ),
-        supports_video=None if unknown_base and "modalities" not in raw else _entry_supports_video(raw),
+        supports_video=None if input_mods is None else ("video" in input_mods),
         supports_reasoning=None if unknown_base and "reasoning" not in raw else bool(raw.get("reasoning", False)),
         context_window=_extract_limit(raw, "context") or 200000,
         max_output_tokens=_extract_limit(raw, "output"),
         model_family=raw.get("family", "") or "",
+        input_modalities=input_mods,
     )
 
 

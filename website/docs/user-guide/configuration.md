@@ -1884,6 +1884,8 @@ Separate from `auxiliary.vision` (which picks the describer model): when the *ma
 
 For `video_analyze`, `agent.video_input_mode` (`auto` | `native` | `auxiliary`, with `text` accepted as an alias for `auxiliary`; default `auto`) controls whether video-capable routes like native Gemini 3+ attach videos directly (20 MB inline cap; public YouTube URLs by URI reference) or route through the auxiliary video/vision model. See [Vision → Native video fast-path](./features/vision.md#native-video-fast-path-agentvideo_input_mode).
 
+Similarly, `agent.audio_input_mode` (`auto` | `native` | `auxiliary`, alias `text`; default `auto`) and `agent.pdf_input_mode` (`auto` | `native` | `text`, alias `auxiliary`; default `auto`) control whether audio and PDF documents are sent natively on capable routes (such as Gemini native / Interactions API) or fall back to transcription/text extraction.
+
 ### Limiting auxiliary concurrency
 
 `max_concurrency` caps in-flight LLM calls for auxiliary tasks such as `compression` and `title_generation` across the whole process. `auxiliary.vision.max_concurrency` is excluded: it already controls only vision's CPU-bound image encode/resize workers, not LLM requests. This is most useful when:

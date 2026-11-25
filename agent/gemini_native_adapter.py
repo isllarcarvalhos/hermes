@@ -24,6 +24,8 @@ from agent.gemini_long_decode import continuation_token, long_decode_hops, merge
 from agent.retry_utils import parse_retry_after_seconds
 from agent.gemini_schema import prepare_gemini_tool_parameters, sanitize_gemini_tool_parameters
 from agent.reasoning_effort import bare_gemini_model_id
+from session_rules.turns import _ALL_MEDIA_PART_TYPES
+from tools.media_io import normalize_audio_mime
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +299,22 @@ def _coerce_content_to_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-_MEDIA_URL_PART_TYPES = frozenset({"image_url", "input_image", "video_url", "input_video"})
+_MEDIA_URL_PART_TYPES = frozenset({
+    "image_url", "input_image", "video_url", "input_video",
+    "audio_url", "audio", "input_audio",
+    "document", "document_url", "file", "input_file",
+})
+_AUDIO_FORMAT_TO_MIME: dict[str, str] = {
+    "mp3": "audio/mpeg", "mpeg": "audio/mpeg", "wav": "audio/wav",
+    "ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/opus",
+    "flac": "audio/flac", "aac": "audio/aac", "m4a": "audio/mp4",
+    "mp4": "audio/mp4", "webm": "audio/webm", "aiff": "audio/aiff",
+    "aif": "audio/aiff", "pcm": "audio/l16", "l16": "audio/l16",
+}
+_DOCUMENT_INLINE_MIMES = frozenset({
+    "application/pdf",
+    "text/csv",
+})
 _STRICT_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _YOUTUBE_VIDEO_ID_RE = re.compile(
     r"^https?://(?:(?:www|m|music)\.)?"
@@ -328,11 +345,50 @@ def _clean_strict_base64(encoded: str) -> Optional[str]:
     return cleaned
 
 
+def _parse_data_url(url: str) -> Optional[tuple[str, str]]:
+    """Return ``(mime, clean_b64)`` for a valid ``data:<mime>;base64,<b64>`` URL; None otherwise."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    header, sep, encoded = url.partition(",")
+    if not sep or ";base64" not in header.lower():
+        return None
+    mime = header[5:].split(";", 1)[0].strip().lower()
+    cleaned = _clean_strict_base64(encoded)
+    return (mime, cleaned) if mime and cleaned else None
+
+
 def _inline_data_part(item: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """``inlineData`` part for an ``image_url``/``input_image``/``video_url``/``input_video`` item carrying a
-    base64 ``data:`` URL, or ``fileData`` for a public YouTube video URL; None otherwise."""
+    """``inlineData`` part for image/video/audio/document parts carrying base64 data,
+    or ``fileData`` for a public YouTube video URL; None otherwise."""
     part_type = item.get("type")
     if part_type not in _MEDIA_URL_PART_TYPES:
+        return None
+    # OpenAI input_audio shape: {"type": "input_audio", "input_audio": {"data": "<raw_b64>", "format": "mp3"}}
+    if part_type == "input_audio":
+        ia = item.get("input_audio")
+        if isinstance(ia, dict):
+            raw_data = ia.get("data")
+            fmt = str(ia.get("format") or "").strip().lower()
+            mime = _AUDIO_FORMAT_TO_MIME.get(fmt) or (normalize_audio_mime(fmt) if fmt.startswith("audio/") else "")
+            if isinstance(raw_data, str) and mime:
+                cleaned = _clean_strict_base64(raw_data)
+                return {"inlineData": {"mimeType": mime, "data": cleaned}} if cleaned else None
+    # Direct {type: "audio"|"document", mime_type: ..., data: <raw_b64>} shape
+    if part_type in ("audio", "document") and isinstance(item.get("data"), str):
+        mime = str(item.get("mime_type") or item.get("media_type") or "").strip().lower()
+        if part_type == "audio":
+            mime = normalize_audio_mime(mime)
+        allowed = mime.startswith("audio/") if part_type == "audio" else (mime in _DOCUMENT_INLINE_MIMES)
+        if allowed:
+            cleaned = _clean_strict_base64(item["data"])
+            return {"inlineData": {"mimeType": mime, "data": cleaned}} if cleaned else None
+    # OpenAI file / input_file shape: {"type": "file", "file": {"file_data": "data:application/pdf;base64,..."}}
+    if part_type in ("file", "input_file"):
+        fobj = item.get("file") if isinstance(item.get("file"), dict) else item
+        fdata = fobj.get("file_data") if isinstance(fobj, dict) else None
+        parsed = _parse_data_url(fdata) if isinstance(fdata, str) else None
+        if parsed and parsed[0] in _DOCUMENT_INLINE_MIMES:
+            return {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
         return None
     payload = item.get(part_type)
     url = (payload.get("url") if isinstance(payload, dict) else payload) or item.get("url") or ""
@@ -340,16 +396,15 @@ def _inline_data_part(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         return None
     if yt_url := normalize_youtube_url(url):
         return {"fileData": {"fileUri": yt_url, "mimeType": "video/mp4"}}
-    if not url.startswith("data:"):
+    parsed = _parse_data_url(url)
+    if not parsed:
         return None
-    header, sep, encoded = url.partition(",")
-    if not sep or ";base64" not in header.lower():
+    mime, cleaned = parsed
+    if mime.startswith("audio/"):
+        mime = normalize_audio_mime(mime)
+    if not (mime.startswith(("image/", "video/", "audio/")) or mime in _DOCUMENT_INLINE_MIMES):
         return None
-    mime = header[5:].split(";", 1)[0].strip().lower()
-    if not mime.startswith(("image/", "video/")):
-        return None
-    cleaned = _clean_strict_base64(encoded)
-    return {"inlineData": {"mimeType": mime, "data": cleaned}} if cleaned else None
+    return {"inlineData": {"mimeType": mime, "data": cleaned}}
 
 
 def _multimodal_part(item: Any) -> Optional[dict[str, Any]]:
@@ -522,6 +577,12 @@ def _build_gemini_contents(
         if role == "assistant" and parts and "functionCall" not in parts[-1] and (
                 sig := _tool_call_extra_signature(msg)):
             parts[-1] = {**parts[-1], "thoughtSignature": sig}
+        if not parts and role not in {"assistant", "system", "tool", "function"}:
+            raw_content = msg.get("content")
+            if isinstance(raw_content, list) and any(
+                isinstance(p, dict) and p.get("type") in _ALL_MEDIA_PART_TYPES for p in raw_content
+            ):
+                parts = [{"text": "[media omitted: invalid payload]"}]
         if parts:
             contents.append({"role": "model" if role == "assistant" else "user", "parts": parts})
     joined_system = "\n".join(part for part in system_text_parts if part).strip()

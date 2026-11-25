@@ -419,13 +419,81 @@ def _special_file_kind(path) -> str | None:
                 "a special (non-regular) file")
 
 
-def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str) -> str | None:
-    """Render an extractable document (.docx/.xlsx/.pdf/...) as paginated text.
+def _try_read_native_pdf(path: str, _resolved, offset: int, task_id: str):
+    """Return a ``_multimodal`` PDF envelope when safe and supported by the active model/route; else None.
+
+    Safety invariants:
+    - Never runs for programmatic ``execute_code`` callers (``_programmatic_read`` must stay JSON/str).
+    - Only runs for unpaginated reads (``offset == 1``); explicit pagination stays on text extraction.
+    - Uses single-fd ``O_RDONLY | O_NOFOLLOW`` + ``fstat`` bounded read + ``%PDF-`` magic verification.
+    - Enforces ``vision_tools_history_budget.reserve_embed`` subagent repeat cap.
+    """
+    if offset != 1 or _resolved.suffix.lower() != ".pdf":
+        return None
+    from tools.file_tools_read_tracking import _programmatic_read
+    if _programmatic_read.get():
+        return None
+    from tools.environments.sandbox_scope import hosted_scope
+    if hosted_scope() is not None:
+        return None
+    file_ops = _get_file_ops(task_id)
+    if not _file_ops_uses_host_paths(file_ops):
+        return None
+    try:
+        from hermes_cli.config import load_config
+        from agent.image_routing import _runtime_main, decide_pdf_input_mode, supports_pdf_in_tool_results
+        provider = _runtime_main("provider")
+        model = _runtime_main("model")
+        base_url = _runtime_main("base_url")
+        requested_provider = _runtime_main("requested_provider")
+        cfg = load_config()
+        if not supports_pdf_in_tool_results(provider, model, cfg, base_url=base_url):
+            return None
+        if decide_pdf_input_mode(
+            provider, model, cfg, requested_provider=requested_provider, allow_network=False,
+        ) != "native":
+            return None
+    except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    from tools.media_io import MAX_NATIVE_MEDIA_RAW_BYTES, is_valid_pdf_bytes, read_file_bounded_nofollow
+    from tools.vision_tools_history_budget import release_embed_key, reserve_embed
+
+    refusal, reserved_key = reserve_embed(str(_resolved), tool_name="read_file", media_label="PDF")
+    if refusal is not None:
+        return refusal
+
+    raw = read_file_bounded_nofollow(str(_resolved), max_bytes=MAX_NATIVE_MEDIA_RAW_BYTES)
+    if raw is None or not is_valid_pdf_bytes(raw):
+        release_embed_key(reserved_key)
+        return None
+
+    encoded = base64.b64encode(raw).decode("ascii")
+    note = (
+        f"Attached PDF natively ({_resolved.name}, {len(raw)} bytes, native_document: true). "
+        "The full PDF is attached visually for direct inspection; no offset pagination is needed."
+    )
+    return {
+        "_multimodal": True,
+        "meta": {"native_document": True, "filename": _resolved.name, "bytes": len(raw)},
+        "content": [
+            {"type": "text", "text": note},
+            {"type": "document", "mime_type": "application/pdf", "data": encoded, "filename": _resolved.name},
+        ],
+        "text_summary": note,
+    }
+
+
+def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str) -> str | dict | None:
+    """Render an extractable document (.docx/.xlsx/.pdf/...) as native PDF or paginated text.
 
     Returns the JSON result, a tool_error for an actionable extraction failure
     (size cap, encrypted, malformed), or ``None`` to fall through to the normal
     read path. Runs BEFORE the binary-extension guard.
     """
+    native_pdf = _try_read_native_pdf(path, _resolved, offset, task_id)
+    if native_pdf is not None:
+        return native_pdf
     from tools.environments.sandbox_scope import hosted_scope
     from tools.read_extract import (
         ANYDOC_EXTENSIONS, EXTRACTABLE_EXTENSIONS, MAX_DOCUMENT_BYTES, ExtractionError,
@@ -635,7 +703,7 @@ def _read_device_base(path: str, task_id: str) -> tuple[Path | PurePosixPath | N
         return None, True
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str | dict:
     """Read a file with pagination and line numbers.
 
     Guard order: NT/device-namespace prefix (raw string, no resolution) →

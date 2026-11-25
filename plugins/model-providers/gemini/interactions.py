@@ -57,6 +57,34 @@ _VIDEO_MIME_TYPES = frozenset({
     "video/x-msvideo", "video/x-matroska",
 })
 _VIDEO_PART_TYPES = frozenset({"video_url", "input_video"})
+_AUDIO_MIME_TYPES = frozenset({
+    "audio/wav", "audio/mp3", "audio/mpeg", "audio/aiff", "audio/aac",
+    "audio/ogg", "audio/flac", "audio/m4a", "audio/mp4", "audio/l16",
+    "audio/opus", "audio/alaw", "audio/mulaw", "audio/webm",
+})
+_AUDIO_FORMAT_TO_MIME: dict[str, str] = {
+    "mp3": "audio/mpeg", "mpeg": "audio/mpeg", "wav": "audio/wav",
+    "ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/opus",
+    "flac": "audio/flac", "aac": "audio/aac", "m4a": "audio/mp4",
+    "mp4": "audio/mp4", "webm": "audio/webm", "aiff": "audio/aiff",
+    "aif": "audio/aiff", "pcm": "audio/l16", "l16": "audio/l16",
+}
+_AUDIO_PART_TYPES = frozenset({"audio", "audio_url", "input_audio"})
+_DOCUMENT_MIME_TYPES = frozenset({
+    "application/pdf",
+    "text/csv",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.presentation",
+    "application/vnd.oasis.opendocument.spreadsheet",
+})
+_DOCUMENT_PART_TYPES = frozenset({"document", "document_url", "file", "input_file"})
+_ALL_MEDIA_PART_TYPES = (
+    frozenset({"image", "image_url", "input_image"}) | _VIDEO_PART_TYPES | _AUDIO_PART_TYPES | _DOCUMENT_PART_TYPES
+)
 _STRICT_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _YOUTUBE_VIDEO_ID_RE = re.compile(
     r"^https?://(?:(?:www|m|music)\.)?"
@@ -143,8 +171,93 @@ def _video_content(item: dict[str, Any]) -> Optional[dict[str, Any]]:
     return {"type": "video", "mime_type": mime, "data": cleaned}
 
 
+def _clean_strict_b64(encoded: str) -> Optional[str]:
+    cleaned = "".join(encoded.split()) if ("\n" in encoded or "\r" in encoded or " " in encoded) else encoded
+    if not cleaned or len(cleaned) % 4 != 0 or not _STRICT_BASE64_RE.fullmatch(cleaned):
+        return None
+    return cleaned
+
+
+def _parse_b64_data_url(url: str) -> Optional[tuple[str, str]]:
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    header, sep, encoded = url.partition(",")
+    if not sep or ";base64" not in header.lower():
+        return None
+    mime = header[5:].split(";", 1)[0].strip().lower()
+    cleaned = _clean_strict_b64(encoded)
+    return (mime, cleaned) if mime and cleaned else None
+
+
+_AUDIO_MIME_ALIASES: dict[str, str] = {
+    "audio/x-wav": "audio/wav", "audio/wave": "audio/wav", "audio/x-pn-wav": "audio/wav",
+    "audio/x-flac": "audio/flac", "audio/x-m4a": "audio/mp4", "audio/x-mp4": "audio/mp4",
+    "audio/x-aiff": "audio/aiff", "audio/x-mpeg": "audio/mpeg", "audio/x-ogg": "audio/ogg",
+    "audio/x-aac": "audio/aac",
+}
+
+
+def _norm_audio_mime(mime: str) -> str:
+    low = (mime or "").split(";", 1)[0].strip().lower()
+    return _AUDIO_MIME_ALIASES.get(low, low)
+
+
+def _audio_content(item: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """``audio`` content for ``audio``/``audio_url``/``input_audio`` carrying base64 data."""
+    part_type = item.get("type")
+    if part_type not in _AUDIO_PART_TYPES:
+        return None
+    if part_type == "input_audio":
+        ia = item.get("input_audio")
+        if isinstance(ia, dict):
+            raw_data = ia.get("data")
+            fmt = str(ia.get("format") or "").strip().lower()
+            mime = _AUDIO_FORMAT_TO_MIME.get(fmt) or _norm_audio_mime(fmt)
+            if isinstance(raw_data, str) and mime in _AUDIO_MIME_TYPES:
+                cleaned = _clean_strict_b64(raw_data)
+                return {"type": "audio", "mime_type": mime, "data": cleaned} if cleaned else None
+    if part_type == "audio" and isinstance(item.get("data"), str):
+        mime = _norm_audio_mime(str(item.get("mime_type") or item.get("media_type") or ""))
+        if mime in _AUDIO_MIME_TYPES:
+            cleaned = _clean_strict_b64(item["data"])
+            return {"type": "audio", "mime_type": mime, "data": cleaned} if cleaned else None
+    payload = item.get(part_type)
+    url = (payload.get("url") if isinstance(payload, dict) else payload) or item.get("url") or ""
+    parsed = _parse_b64_data_url(url) if isinstance(url, str) else None
+    if parsed:
+        mime = _norm_audio_mime(parsed[0])
+        if mime in _AUDIO_MIME_TYPES:
+            return {"type": "audio", "mime_type": mime, "data": parsed[1]}
+    return None
+
+
+def _document_content(item: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """``document`` content for ``document``/``document_url``/``file``/``input_file`` carrying base64 data."""
+    part_type = item.get("type")
+    if part_type not in _DOCUMENT_PART_TYPES:
+        return None
+    if part_type == "document" and isinstance(item.get("data"), str):
+        mime = str(item.get("mime_type") or item.get("media_type") or "").strip().lower()
+        if mime in _DOCUMENT_MIME_TYPES:
+            cleaned = _clean_strict_b64(item["data"])
+            return {"type": "document", "mime_type": mime, "data": cleaned} if cleaned else None
+    if part_type in ("file", "input_file"):
+        fobj = item.get("file") if isinstance(item.get("file"), dict) else item
+        fdata = fobj.get("file_data") if isinstance(fobj, dict) else None
+        parsed = _parse_b64_data_url(fdata) if isinstance(fdata, str) else None
+        if parsed and parsed[0] in _DOCUMENT_MIME_TYPES:
+            return {"type": "document", "mime_type": parsed[0], "data": parsed[1]}
+        return None
+    payload = item.get(part_type)
+    url = (payload.get("url") if isinstance(payload, dict) else payload) or item.get("url") or ""
+    parsed = _parse_b64_data_url(url) if isinstance(url, str) else None
+    if parsed and parsed[0] in _DOCUMENT_MIME_TYPES:
+        return {"type": "document", "mime_type": parsed[0], "data": parsed[1]}
+    return None
+
+
 def _media_content(item: dict[str, Any]) -> Optional[dict[str, Any]]:
-    return _image_content(item) or _video_content(item)
+    return _image_content(item) or _video_content(item) or _audio_content(item) or _document_content(item)
 
 
 def _content_blocks(content: Any) -> list[dict[str, Any]]:
@@ -178,7 +291,7 @@ def _function_result(message: dict[str, Any], names: dict[str, str]) -> dict[str
         parsed = json.loads(text) if text.strip().startswith(("{", "[")) else None
     except json.JSONDecodeError:
         parsed = None
-    media_blocks = [b for b in _content_blocks(raw) if b["type"] in ("image", "video")] if isinstance(raw, list) else []
+    media_blocks = [b for b in _content_blocks(raw) if b["type"] in ("image", "video", "audio", "document")] if isinstance(raw, list) else []
     if media_blocks:
         result: Any = [*([{"type": "text", "text": text}] if text else []), *media_blocks]
     elif isinstance(parsed, dict) and not _looks_like_json_schema(parsed):
@@ -237,11 +350,18 @@ def build_input_steps(messages: list[dict[str, Any]]) -> tuple[list[dict[str, An
             steps.append(_function_result(message, names))
         elif role == "assistant":
             steps.extend(_assistant_steps(message, names))
-        elif blocks := _content_blocks(message.get("content")):
-            if steps and steps[-1]["type"] == "user_input":
-                steps[-1]["content"].extend(blocks)  # adjacent user turns fold into one input step
-            else:
-                steps.append({"type": "user_input", "content": blocks})
+        else:
+            raw_content = message.get("content")
+            blocks = _content_blocks(raw_content)
+            if not blocks and isinstance(raw_content, list) and any(
+                isinstance(p, dict) and p.get("type") in _ALL_MEDIA_PART_TYPES for p in raw_content
+            ):
+                blocks = [{"type": "text", "text": "[media omitted: invalid payload]"}]
+            if blocks:
+                if steps and steps[-1]["type"] == "user_input":
+                    steps[-1]["content"].extend(blocks)  # adjacent user turns fold into one input step
+                else:
+                    steps.append({"type": "user_input", "content": blocks})
     joined = "\n".join(part for part in system if part).strip()
     return steps, joined or None
 

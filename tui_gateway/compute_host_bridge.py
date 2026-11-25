@@ -50,11 +50,12 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
 def _compute_host_turn_frame(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    display_metadata: dict | None = None) -> dict:
+    display_metadata: dict | None = None, attached_documents: list[dict] | None = None) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
+        attached_docs = list(attached_documents if attached_documents is not None else session.get("attached_documents", []))
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
@@ -77,6 +78,7 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
+        "attached_documents": attached_docs,
         "auth_user_id": _session_auth_user_id(session),
         "queued_prompt_generation": queued_prompt_generation,
         # #101416: vouch that this process already holds the registry lease for this session, so
@@ -319,11 +321,12 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
 def _submit_prompt_to_compute_host(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    display_metadata: dict | None = None) -> dict:
+    display_metadata: dict | None = None, attached_documents: list[dict] | None = None) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
                                      queued_prompt_generation=queued_prompt_generation,
-                                     display_kind=display_kind, display_metadata=display_metadata)
+                                     display_kind=display_kind, display_metadata=display_metadata,
+                                     attached_documents=attached_documents)
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex
@@ -353,6 +356,8 @@ def _submit_prompt_to_compute_host(
         session["_compute_host_active"] = True
         if image_paths is None:
             session["attached_images"] = []
+        if image_paths is None and attached_documents is None:
+            session["attached_documents"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 

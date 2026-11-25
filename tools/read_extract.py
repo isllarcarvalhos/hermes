@@ -459,10 +459,45 @@ def _open_zip(path: str, kind: str) -> Iterator[zipfile.ZipFile]:
         raise ExtractionError(f"Not a valid {kind}: {exc}" if bad_zip else str(exc)) from exc
 
 
-def _zip_xml(zf: zipfile.ZipFile, name: str, optional: bool = False) -> Any:
+_MAX_ZIP_MEMBER_BYTES = 25 * 1024 * 1024
+_MAX_ZIP_TOTAL_BYTES = 100 * 1024 * 1024
+
+
+def _read_zip_member_bounded(
+    zf: zipfile.ZipFile,
+    name: str,
+    *,
+    max_member_bytes: int = _MAX_ZIP_MEMBER_BYTES,
+    budget: Optional[list[int]] = None,
+) -> bytes:
+    """Read a zip member with strict decompressed size bounds to prevent zip bombs."""
+    info = zf.getinfo(name)
+    remaining = budget[0] if budget is not None else _MAX_ZIP_TOTAL_BYTES
+    limit = min(max_member_bytes, remaining)
+    if info.file_size > limit or limit <= 0:
+        raise ExtractionError(
+            f"Archive member '{name}' exceeds safe decompressed size limit ({info.file_size} > {max(limit, 0)} bytes)"
+        )
+    chunks: list[bytes] = []
+    total = 0
+    with zf.open(info, "r") as fp:
+        while True:
+            chunk = fp.read(min(65536, limit - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ExtractionError(f"Archive member '{name}' exceeds safe decompressed size limit ({limit} bytes)")
+            chunks.append(chunk)
+    if budget is not None:
+        budget[0] = max(0, budget[0] - total)
+    return b"".join(chunks)
+
+
+def _zip_xml(zf: zipfile.ZipFile, name: str, optional: bool = False, *, budget: Optional[list[int]] = None) -> Any:
     """Parse a package part; ``optional`` parts yield an empty element when absent or malformed."""
     try:
-        return ET.fromstring(zf.read(name))
+        return ET.fromstring(_read_zip_member_bounded(zf, name, budget=budget))
     except (KeyError, ET.ParseError) as exc:
         if optional:
             return ET.Element("missing")
@@ -472,8 +507,9 @@ def _zip_xml(zf: zipfile.ZipFile, name: str, optional: bool = False) -> Any:
 
 
 def _extract_docx(path: str) -> str:
+    budget = [_MAX_ZIP_TOTAL_BYTES]
     with _open_zip(path, "DOCX") as zf:
-        root = _zip_xml(zf, "word/document.xml")
+        root = _zip_xml(zf, "word/document.xml", budget=budget)
     w = f"{{{_NS_W}}}"
     breaks = {f"{w}tab": "\t", f"{w}br": "\n", f"{w}cr": "\n"}
     lines: list[str] = []
@@ -496,21 +532,22 @@ def _xlsx_string_text(item: ET.Element, s: str) -> str:
 
 def _extract_xlsx(path: str) -> str:
     s, r, pr = f"{{{_NS_S}}}", f"{{{_NS_REL}}}", f"{{{_NS_PKG_REL}}}"
+    budget = [_MAX_ZIP_TOTAL_BYTES]
     with _open_zip(path, "XLSX") as zf:
         names = set(zf.namelist())
-        sst = _zip_xml(zf, "xl/sharedStrings.xml", optional=True)
+        sst = _zip_xml(zf, "xl/sharedStrings.xml", optional=True, budget=budget)
         shared = [_xlsx_string_text(item, s) for item in sst.iter(f"{s}si")]
-        rels_root = _zip_xml(zf, "xl/_rels/workbook.xml.rels", optional=True)
+        rels_root = _zip_xml(zf, "xl/_rels/workbook.xml.rels", optional=True, budget=budget)
         rels = {rel.get("Id", ""): rel.get("Target", "")
                 for rel in rels_root.iter(f"{pr}Relationship") if rel.get("Id")}
         out: list[str] = []
-        for sheet in _zip_xml(zf, "xl/workbook.xml").iter(f"{s}sheet"):
+        for sheet in _zip_xml(zf, "xl/workbook.xml", budget=budget).iter(f"{s}sheet"):
             target = rels.get(sheet.get(f"{r}id", ""), "").lstrip("/")
             part = posixpath.normpath(target if target.startswith("xl/") else f"xl/{target}")
             if sheet.get("state", "visible") in {"hidden", "veryHidden"} or part not in names:
                 continue
             with contextlib.suppress(ET.ParseError):
-                rows = _sheet_rows(zf.read(part), shared)
+                rows = _sheet_rows(_read_zip_member_bounded(zf, part, budget=budget), shared)
                 out += [f"# ── Sheet: {sheet.get('name', 'Sheet')} ──",
                         *(["\t".join(row) for row in rows] or ["(empty)"]), ""]
     return _joined(out, "XLSX has no visible sheets with content")

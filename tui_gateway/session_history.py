@@ -73,7 +73,9 @@ def _build_persist_user_message(user_text: str, image_paths: list[str], run_mess
 
 _HISTORY_TEXT_KINDS = frozenset({"text", "input_text", "output_text"})
 _HISTORY_IMAGE_KINDS = frozenset({"image_url", "input_image", "image"})
-_HISTORY_AUDIO_KINDS = frozenset({"input_audio", "audio"})
+_HISTORY_VIDEO_KINDS = frozenset({"video_url", "input_video", "video"})
+_HISTORY_AUDIO_KINDS = frozenset({"input_audio", "audio", "audio_url"})
+_HISTORY_DOCUMENT_KINDS = frozenset({"document", "document_url", "file", "input_file"})
 
 
 def _history_part_image_url(part: dict) -> str:
@@ -91,8 +93,14 @@ def _history_dict_text(content: dict, *, image_urls: bool) -> str:
         return str(content.get("text") or content.get("content") or "")
     if kind in _HISTORY_IMAGE_KINDS:
         return (_history_part_image_url(content) if image_urls else "") or "[image]"
+    if kind in _HISTORY_VIDEO_KINDS:
+        return "[video]"
     if kind in _HISTORY_AUDIO_KINDS:
         return "[audio]"
+    if kind in _HISTORY_DOCUMENT_KINDS:
+        name = content.get("filename") or content.get("title") or ""
+        clean = str(name).strip() if isinstance(name, str) else ""
+        return f"[document: {clean}]" if clean else "[document]"
     if kind:
         return f"[{kind}]"
     if "text" in content:
@@ -117,11 +125,13 @@ def _coerce_message_text(content: Any, *, image_urls: bool = True) -> str:
     if isinstance(content, list):
         chunks: list[str] = []
         for part in content:
-            if isinstance(part, str) or (isinstance(part, dict) and isinstance(part.get("text"), str)):
-                chunks.append(part if isinstance(part, str) else part["text"])
+            if isinstance(part, str):
+                chunks.append(part)
             elif isinstance(part, dict) and part.get("type"):
                 rendered = _history_dict_text(part, image_urls=image_urls)
                 chunks.append(rendered if part["type"] in _HISTORY_TEXT_KINDS else f"\n{rendered}")
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                chunks.append(part["text"])
         return "".join(chunks)
     if isinstance(content, dict):
         return _history_dict_text(content, image_urls=image_urls)

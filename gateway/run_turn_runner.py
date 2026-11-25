@@ -1060,18 +1060,28 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if api is not None and isinstance(api.get('content'), list):
             return api['content']
         native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
-        if not native_imgs:
+        native_media = self._runner._consume_pending_native_media_attachments(ctx.session_key)
+        if not native_imgs and not native_media:
             return ctx.message
-        try:
-            from agent.image_routing import build_native_content_parts
-            parts, skipped = build_native_content_parts(ctx.message, native_imgs)
-            if skipped:
-                logger.warning("Native image attachment: skipped %d unreadable path(s): %s", len(skipped), skipped)
-            if any(p.get("type") == "image_url" for p in parts):
-                return parts
-        except Exception as exc:
-            logger.warning("Native image attachment failed, falling back to text: %s", exc)
-        return ctx.message
+        parts: list[dict] = []
+        if native_imgs:
+            try:
+                from agent.image_routing import build_native_content_parts
+                img_parts, skipped = build_native_content_parts(ctx.message, native_imgs)
+                if skipped:
+                    logger.warning("Native image attachment: skipped %d unreadable path(s): %s", len(skipped), skipped)
+                if any(p.get("type") == "image_url" for p in img_parts):
+                    parts = img_parts
+            except Exception as exc:
+                logger.warning("Native image attachment failed, falling back to text: %s", exc)
+        if native_media:
+            from gateway.run_inbound_native_media import materialize_native_media_parts
+            media_parts = materialize_native_media_parts(native_media)
+            if media_parts:
+                if not parts:
+                    parts = ([{"type": "text", "text": str(ctx.message)}] if str(ctx.message or "").strip() else [])
+                parts = [*parts, *media_parts]
+        return parts or ctx.message
 
     def _run_conversation_with_approval(self, agent, agent_history, observed_group_context,
                                         persist_user_message_override, persist_user_timestamp_override):

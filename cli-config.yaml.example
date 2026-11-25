@@ -1243,6 +1243,10 @@ agent:
   # How video_analyze routes videos: "auto" (native on video-capable routes like Gemini 3+
   # unless auxiliary.vision / AUXILIARY_VIDEO_MODEL is explicitly configured), "native", or "auxiliary" (alias "text").
   # video_input_mode: auto
+  # How inbound audio files ("auto" | "native" | "auxiliary", alias "text") and PDF documents
+  # ("auto" | "native" | "text", alias "auxiliary") route on capable models (15 MB raw inline cap).
+  # audio_input_mode: auto
+  # pdf_input_mode: auto
 
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
