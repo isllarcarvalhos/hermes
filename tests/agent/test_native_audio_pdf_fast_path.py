@@ -16,7 +16,7 @@ from agent.context_compressor import (
     _strip_images_from_tool_msg,
     evict_stale_outbound_tool_images,
 )
-from agent.gemini_native_adapter import (
+from plugins.model_providers.google.native_adapter import (
     _build_gemini_contents,
     _inline_data_part,
     _translate_tool_result_parts_to_gemini,
