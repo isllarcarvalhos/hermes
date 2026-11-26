@@ -245,3 +245,41 @@ def test_persistence_trajectory_and_trace_upload_never_leak_base64_video_or_scre
 
     trace_block = _part_to_block(content[1], redact=False)
     assert trace_block == {"type": "text", "text": "[video omitted]"}
+
+
+def test_video_does_not_poison_image_ema_or_vision_rejection_and_preserves_captionless_turns():
+    from types import SimpleNamespace
+    from agent.image_token_cost import _LEARNED, calibrate_from_usage, count_images
+    from agent.message_sanitization import record_media_rejection, strip_images_for_rejecting_model
+
+    # 1. Video parts are excluded from count_images so video turns never poison image_token_costs.json EMA
+    vid_msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "user", "content": [{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}]},
+    ]
+    assert count_images(vid_msgs) == 0
+    _LEARNED.clear()
+    ag_ema = SimpleNamespace(
+        model="gemini-3-flash-ema-test",
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        _usage_anchor={"base_count": 1, "prompt_tokens": 500, "base_msg_ids": []},
+    )
+    with patch("agent.usage_anchor.anchored_context_tokens", return_value=520), patch("utils.atomic_json_write") as w:
+        assert calibrate_from_usage(ag_ema, vid_msgs, prompt_tokens=18_520) is None
+        assert not w.called
+
+    # 2. Explicit and generic video rejections mark "video" modality without poisoning _image_rejecting_models
+    ag1 = SimpleNamespace(provider="openai", model="gpt-5", _image_rejecting_models=set(), _rejected_media_modalities={})
+    assert record_media_rejection(ag1, "400: video is not supported by this model", vid_msgs) == "video"
+    assert ag1._image_rejecting_models == set()
+
+    ag2 = SimpleNamespace(provider="openai", model="gpt-5-b", _image_rejecting_models=set(), _rejected_media_modalities={})
+    assert record_media_rejection(ag2, "400: multimodal input is not supported", vid_msgs) == "video"
+    assert ag2._image_rejecting_models == set()
+
+    # 3. _strip_all_media_from_messages (via strip_images_for_rejecting_model) preserves captionless user turns with accurate labels
+    ag3 = SimpleNamespace(provider="openai", model="text-only", _image_rejecting_models={("openai", "text-only")}, _rejected_media_modalities={})
+    cap_doc = [{"role": "user", "content": [{"type": "document", "mime_type": "application/pdf", "data": "JVBERi0x"}]}]
+    assert strip_images_for_rejecting_model(ag3, cap_doc) is True
+    assert len(cap_doc) == 1 and cap_doc[0]["role"] == "user"
+    assert "document content removed" in cap_doc[0]["content"].lower()

@@ -272,10 +272,17 @@ def recover_before_classification(
         pass
     _err_status = getattr(api_error, "status_code", None)
     _status_ok = _err_status is None or (400 <= int(_err_status) < 500)
+    _sent_wire = (
+        api_kwargs.get("messages")
+        if isinstance(api_kwargs, dict)
+        and isinstance(api_kwargs.get("messages"), list)
+        and getattr(agent, "api_mode", "") != "bedrock_converse"
+        else (api_kwargs.get("input") if isinstance(api_kwargs, dict) and isinstance(api_kwargs.get("input"), list) else None)
+    )
     if _status_ok and _looks_like_corrupt_image_rejection(_err_body):
         if _strip_request_images_and_retry(agent, api_messages):
             return True, active_system_prompt
-    elif _status_ok and (rejected_kind := record_media_rejection(agent, _err_body, api_messages or messages)):
+    elif _status_ok and (rejected_kind := record_media_rejection(agent, _err_body, _sent_wire if _sent_wire is not None else (api_messages or messages))):
         _vlines(agent, f"⚠️  Server rejected {rejected_kind} content — sending without {rejected_kind} to this model; media stays in session history.")
         return True, active_system_prompt
 

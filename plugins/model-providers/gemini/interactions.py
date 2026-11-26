@@ -122,10 +122,13 @@ _HTTP_ERROR_CODES = {401: "gemini_unauthorized", 429: "gemini_rate_limited", 404
 
 # ── OpenAI messages -> Interactions steps ────────────────────────────────────
 def _image_content(item: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """``image`` content for an ``image_url`` item carrying a ``data:`` URL; None otherwise (remote URLs
+    """``image`` content for an ``image_url``/``input_image`` item carrying a ``data:`` URL; None otherwise (remote URLs
     are dropped, as on the generateContent path)."""
-    url = (item.get("image_url") or {}).get("url") or ""
-    if item.get("type") != "image_url" or not isinstance(url, str) or not url.startswith("data:"):
+    if item.get("type") not in ("image_url", "input_image"):
+        return None
+    raw = item.get("image_url")
+    url = (raw.get("url") if isinstance(raw, dict) else raw) or item.get("url") or ""
+    if not isinstance(url, str) or not url.startswith("data:"):
         return None
     try:
         header, encoded = url.split(",", 1)
@@ -238,10 +241,10 @@ def _document_content(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         return None
     if part_type == "document":
         if isinstance(item.get("data"), str):
-            mime = str(item.get("mime_type") or item.get("media_type") or "").strip().lower()
+            mime = str(item.get("mime_type") or item.get("media_type") or "").split(";", 1)[0].strip().lower()
             raw_b64 = item["data"]
         elif isinstance(src := item.get("source"), dict) and src.get("type") == "base64" and isinstance(src.get("data"), str):
-            mime = str(src.get("media_type") or src.get("mime_type") or "").strip().lower()
+            mime = str(src.get("media_type") or src.get("mime_type") or "").split(";", 1)[0].strip().lower()
             raw_b64 = src["data"]
         else:
             mime, raw_b64 = "", ""

@@ -28,6 +28,7 @@ _VALID_MODES = frozenset({"auto", "native", "text"})
 _VALID_VIDEO_MODES = frozenset({"auto", "native", "auxiliary"})
 _VIDEO_MODE_ALIASES = {"text": "auxiliary"}
 _GEMINI_NATIVE_VIDEO_PROVIDERS = frozenset({"google", "gemini", "google-gemini", "google-ai-studio", "google-vertex-gemini", "solstice"})
+_ANTHROPIC_PDF_PROVIDERS = frozenset({"anthropic", "claude", "claude-oauth", "claude-code"})
 
 
 # Extensions extract_image_refs() auto-attaches. Documents/archives are excluded:
@@ -645,8 +646,6 @@ def is_native_gemini_video_route(
         return True
     resolved_url = _provider_base_url_for_video_route(cfg, p, base_url=base_url)
     if resolved_url:
-        if resolved_url.rstrip("/").lower().endswith("/v1"):
-            return False
         return is_native_gemini_base_url(resolved_url)
     return p in _GEMINI_NATIVE_VIDEO_PROVIDERS
 
@@ -657,8 +656,11 @@ def supports_video_in_tool_results(
     cfg: Optional[dict[str, Any]] = None,
     *,
     base_url: str = "",
+    api_mode: str = "",
 ) -> bool:
     """Whether provider+model accepts video media inside tool-result messages."""
+    if api_mode in ("anthropic_messages", "bedrock_converse", "codex_responses"):
+        return False
     return is_native_gemini_video_route(provider, model, cfg, base_url=base_url)
 
 
@@ -679,10 +681,35 @@ def _is_native_gemini_user_media_route(
     from agent.gemini_native_adapter import is_native_gemini_base_url
     resolved_url = _provider_base_url_for_video_route(cfg, p, base_url=base_url)
     if resolved_url:
-        if resolved_url.rstrip("/").lower().endswith("/v1"):
-            return False
         return is_native_gemini_base_url(resolved_url)
     return p in _GEMINI_NATIVE_VIDEO_PROVIDERS
+
+
+def _is_native_anthropic_pdf_route(
+    provider: str,
+    model: str,
+    *,
+    base_url: str = "",
+    api_mode: str = "",
+) -> bool:
+    """True only for genuine Anthropic / AnthropicBedrock Messages routes (never MiniMax or arbitrary proxies)."""
+    if not _clean_str(model):
+        return False
+    p = _clean_str(provider).lower()
+    clean_url = _clean_str(base_url)
+    if p in _ANTHROPIC_PDF_PROVIDERS:
+        if api_mode and api_mode != "anthropic_messages":
+            return False
+        if clean_url:
+            from utils import base_url_host_matches
+            return base_url_host_matches(clean_url, "api.anthropic.com")
+        return True
+    if p == "bedrock" and api_mode == "anthropic_messages":
+        return True
+    if api_mode == "anthropic_messages" and clean_url:
+        from utils import base_url_host_matches
+        return base_url_host_matches(clean_url, "api.anthropic.com")
+    return False
 
 
 def supports_audio_in_user_turns(
@@ -710,9 +737,10 @@ def supports_pdf_in_user_turns(
     """Whether provider+model accepts native PDF documents inside user-turn messages."""
     if api_mode in ("bedrock_converse", "codex_responses"):
         return False
-    p = _clean_str(provider).lower()
-    if api_mode == "anthropic_messages" or (not api_mode and p == "anthropic"):
-        return bool(_clean_str(model))
+    if _is_native_anthropic_pdf_route(provider, model, base_url=base_url, api_mode=api_mode):
+        return True
+    if api_mode == "anthropic_messages":
+        return False
     return _is_native_gemini_user_media_route(provider, model, cfg, base_url=base_url)
 
 
@@ -722,8 +750,11 @@ def supports_audio_in_tool_results(
     cfg: Optional[dict[str, Any]] = None,
     *,
     base_url: str = "",
+    api_mode: str = "",
 ) -> bool:
     """Whether provider+model accepts native audio inside tool-result messages."""
+    if api_mode in ("anthropic_messages", "bedrock_converse", "codex_responses"):
+        return False
     return is_native_gemini_video_route(provider, model, cfg, base_url=base_url)
 
 
@@ -733,8 +764,11 @@ def supports_pdf_in_tool_results(
     cfg: Optional[dict[str, Any]] = None,
     *,
     base_url: str = "",
+    api_mode: str = "",
 ) -> bool:
     """Whether provider+model accepts native PDF documents inside tool-result messages."""
+    if api_mode in ("anthropic_messages", "bedrock_converse", "codex_responses"):
+        return False
     return is_native_gemini_video_route(provider, model, cfg, base_url=base_url)
 
 

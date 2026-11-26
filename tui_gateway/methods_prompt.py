@@ -1095,19 +1095,51 @@ def _(rid, params: dict) -> dict:
 
 
 def _session_supports_native_pdf(session: dict) -> bool:
-    """True when the session's active agent/model+route accepts native PDF document parts."""
-    agent = session.get("agent")
-    if agent is None:
-        return False
+    """True when the session's active agent/model+route accepts native PDF document parts.
+
+    Handles both built agents and lazy/compute-host sessions (``agent is None``) by reading
+    pending switch, metadata mirror, session ``model_override``, or profile-scoped ``config.yaml``.
+    """
     try:
         from agent.image_routing import decide_pdf_input_mode, supports_pdf_in_user_turns
         from hermes_cli.config import load_config as _tui_load_config
-        provider = str(getattr(agent, "provider", "") or "").strip()
-        model = str(getattr(agent, "model", "") or "").strip()
-        base_url = str(getattr(agent, "base_url", "") or "").strip()
-        requested_provider = str(getattr(agent, "requested_provider", "") or "").strip()
-        api_mode = str(getattr(agent, "api_mode", "") or "").strip()
         cfg = _tui_load_config()
+        agent = session.get("agent")
+        if agent is not None:
+            provider = str(getattr(agent, "provider", "") or "").strip()
+            model = str(getattr(agent, "model", "") or "").strip()
+            base_url = str(getattr(agent, "base_url", "") or "").strip()
+            requested_provider = str(getattr(agent, "requested_provider", "") or "").strip()
+            api_mode = str(getattr(agent, "api_mode", "") or "").strip()
+        else:
+            pending = session.get("pending_model_switch") if isinstance(session.get("pending_model_switch"), dict) else {}
+            mirror = _metadata_mirror(session)
+            override = session.get("model_override") if isinstance(session.get("model_override"), dict) else {}
+            model_cfg = cfg.get("model") if isinstance(cfg, dict) and isinstance(cfg.get("model"), dict) else {}
+            model = str(
+                pending.get("display_model") or pending.get("model")
+                or mirror.get("model")
+                or override.get("model")
+                or model_cfg.get("default") or model_cfg.get("model")
+                or ""
+            ).strip()
+            provider = str(
+                pending.get("display_provider") or pending.get("provider")
+                or mirror.get("provider")
+                or override.get("provider")
+                or model_cfg.get("provider")
+                or ""
+            ).strip()
+            base_url = str(
+                pending.get("base_url") or mirror.get("base_url")
+                or override.get("base_url") or model_cfg.get("base_url") or ""
+            ).strip()
+            requested_provider = str(override.get("provider") or provider).strip()
+            api_mode = str(
+                pending.get("api_mode") or mirror.get("api_mode") or override.get("api_mode") or ""
+            ).strip()
+        if not provider and not model:
+            return False
         return (
             supports_pdf_in_user_turns(provider, model, cfg, base_url=base_url, api_mode=api_mode)
             and decide_pdf_input_mode(
@@ -1145,9 +1177,12 @@ def _(rid, params: dict) -> dict:
             pdf_bytes = read_file_bounded_nofollow(str(pdf_path), max_bytes=MAX_NATIVE_MEDIA_RAW_BYTES)
             if pdf_bytes is not None and is_valid_pdf_bytes(pdf_bytes):
                 data_url = f"data:application/pdf;base64,{_b64.b64encode(pdf_bytes).decode('ascii')}"
-                stored_path, _ = _stage_session_file_attachment(
-                    session, raw_path="", data_url=data_url, name=display_name,
-                )
+                try:
+                    stored_path, _ = _stage_session_file_attachment(
+                        session, raw_path="", data_url=data_url, name=display_name,
+                    )
+                except (OSError, ValueError, OverflowError, RuntimeError) as exc:
+                    return _err(rid, 5028, str(exc))
                 with session["history_lock"]:
                     docs = session.setdefault("attached_documents", [])
                     docs.append({

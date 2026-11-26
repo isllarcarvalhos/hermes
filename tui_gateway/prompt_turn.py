@@ -148,7 +148,9 @@ def _admit_prompt_turn(
                 # the session already held stays for close's own handoff (_settle_isolated_turn_before_close).
                 _release_active_session_slot(session)
             return None
-        consume_live = image_paths is None and attached_documents is None
+        consume_live = (
+            image_paths is None and attached_documents is None and queued_prompt_generation is None
+        )
         images = list(session.get("attached_images", []) if consume_live else (image_paths or []))
         turn_docs = list(session.get("attached_documents", []) if consume_live else (attached_documents or []))
         inflight = session.get("inflight_turn")
@@ -863,7 +865,8 @@ def _invoke_agent(
         "conversation_history": list(st.history),
         "stream_callback": _stream,
         "persist_user_message": (
-            _build_persist_user_message(prompt, images, run_message) if images else prompt)}
+            _build_persist_user_message(prompt, images, run_message)
+            if (images or (isinstance(prompt, str) and isinstance(run_message, list))) else prompt)}
     try:
         run_params = inspect.signature(agent.run_conversation).parameters
     except (TypeError, ValueError):

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_eviction_policy import images_all_within_many_image_limit, outbound_image_retire_count
 from agent.anthropic_thinking_policy import anthropic_thinking_route, route_replays_prior_thinking
+from session_rules.turns import _ALL_MEDIA_PART_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +295,8 @@ def _content_parts_to_anthropic_blocks(parts: Any) -> list[dict[str, Any]]:
             out.append(_text_block(text_val))
         elif btype == "image" and isinstance(src, dict) and src:
             out.append({"type": "image", "source": src})
+        elif btype == "document":
+            out.append(_text_block("[document omitted — unsupported in Anthropic tool results]"))
     return out
 
 
@@ -470,6 +473,10 @@ def _tool_result_content(m: dict[str, Any]) -> Any:
         converted = _content_parts_to_anthropic_blocks(content)
         if _has_block_type(converted, {"image"}):
             multimodal_blocks = converted
+        elif any(isinstance(p, dict) and p.get("type") in _ALL_MEDIA_PART_TYPES for p in content):
+            # Never fall through to json.dumps(content) on media-bearing lists (leaks raw base64).
+            texts = [b["text"] for b in converted if b.get("type") == "text" and b.get("text")]
+            return "\n\n".join(texts) or "[media omitted — unsupported in Anthropic tool results]"
     if multimodal_blocks is None:  # back-compat: blocks stashed under a private key
         stashed = m.get("_anthropic_content_blocks")
         if isinstance(stashed, list) and stashed:

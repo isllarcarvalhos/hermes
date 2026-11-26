@@ -42,11 +42,8 @@ from tools.website_policy import check_website_access
 from tools.vision_tools_history_budget import (
     native_turn_duplicate as _native_turn_duplicate,
     record_embed as _record_embed,
-    release_embed as _release_embed,
     release_embed_key as _release_embed_key,
-    repeat_refusal as _repeat_refusal,
     reserve_embed as _reserve_embed,
-    resolve_repeat_cap as _resolve_repeat_cap,
     resolve_embed_target_bytes as _resolve_embed_target_bytes,
 )
 from tools.vision_tools_image_prep import (
@@ -729,14 +726,20 @@ async def _vision_analyze_native(
     or a JSON error string (the normal tool-result contract) on failure."""
     if not isinstance(image_url, str) or not image_url.strip():
         return tool_error("image_url is required", success=False)
+    if "\x00" in image_url:
+        return tool_error("Invalid image source: path contains null byte.", success=False)
+    stripped_url = image_url.strip()
+    if not stripped_url.lower().startswith(("http://", "https://", "data:")):
+        from agent.file_safety import get_nt_namespace_error
+        if nt_err := get_nt_namespace_error(_parse_file_uri(stripped_url), verb="Read"):
+            return tool_error(nt_err, success=False)
     already_native = _native_turn_duplicate(image_url, region)
     if already_native is not None:
         return already_native
     # A cap > 0 RESERVES the slot here (atomic check-and-count); released below if no embed happens.
-    refusal = _repeat_refusal(image_url)
+    refusal, reserved_key = _reserve_embed(image_url)
     if refusal is not None:
         return refusal
-    reserved = _resolve_repeat_cap() > 0
     prepared: Optional[_PreparedImage] = None
     embedded = False
     try:
@@ -766,7 +769,7 @@ async def _vision_analyze_native(
             if len(image_data_url) > _MAX_BASE64_BYTES:
                 return tool_error(_too_large_message(image_data_url), success=False)
         embedded = True
-        if not reserved:
+        if reserved_key is None:
             _record_embed(image_url)
         return _build_native_vision_tool_result(
             image_url=image_url, question=question, image_data_url=image_data_url,
@@ -776,8 +779,8 @@ async def _vision_analyze_native(
         logger.warning("Native vision fast path failed: %s", exc)
         return tool_error(f"Native vision failed: {exc}", success=False)
     finally:
-        if reserved and not embedded:
-            _release_embed(image_url)
+        if reserved_key is not None and not embedded:
+            _release_embed_key(reserved_key)
         # Only delete temp files we created — never user-provided paths.
         if prepared is not None:
             _unlink_quietly(prepared.path)
@@ -1140,6 +1143,46 @@ def _validate_video_header_bytes(
     return None
 
 
+def _open_regular_video_nofollow(resolved: Path) -> tuple[Optional[int], Optional[os.stat_result], Optional[str]]:
+    """Open *resolved* as a regular file without following symlinks or blocking on FIFOs."""
+    has_nofollow = hasattr(os, "O_NOFOLLOW")
+    lst = None
+    if not has_nofollow:
+        try:
+            lst = os.lstat(str(resolved))
+        except OSError as exc:
+            return None, None, f"Could not stat video file: {exc}"
+        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+            return None, None, "Video source is not a regular file."
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(str(resolved), flags)
+    except OSError as exc:
+        return None, None, f"Could not open video file: {exc}"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            return None, None, "Video source is not a regular file."
+        if lst is not None and (
+            (lst.st_ino and st.st_ino != lst.st_ino) or (lst.st_dev and st.st_dev != lst.st_dev)
+        ):
+            os.close(fd)
+            return None, None, "Video source changed concurrently during open."
+        return fd, st, None
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, None, f"Could not read video file: {exc}"
+
+
 def _read_and_encode_video_bounded(
     video_path: Path,
     mime_type: str,
@@ -1152,29 +1195,30 @@ def _read_and_encode_video_bounded(
     """TOCTOU-safe single-fd bounded read, magic-byte validation, and base64 data-URL encoding.
 
     Resolves the path, enforces ``raise_if_read_blocked`` on the canonical path, opens once with
-    ``O_NOFOLLOW`` (rejecting concurrent symlink swaps), checks ``fstat`` regular-file + byte cap,
-    reads at most ``max_raw_bytes + 1`` bytes, validates magic bytes on the in-memory buffer, and
-    encodes from that same validated buffer. Returns ``(size_bytes, data_url_or_none, error_or_none)``.
+    ``O_NOFOLLOW`` + ``O_NONBLOCK`` (rejecting concurrent symlink swaps and FIFOs), checks ``fstat``
+    regular-file + byte cap, reads at most ``max_raw_bytes + 1`` bytes, validates magic bytes on the
+    in-memory buffer, and encodes from that same validated buffer. Returns ``(size_bytes, data_url_or_none, error_or_none)``.
     """
+    raw_path_str = str(video_path)
+    if "\x00" in raw_path_str:
+        return 0, None, "Invalid video source: path contains null byte."
+    if check_file_safety:
+        from agent.file_safety import get_nt_namespace_error, raise_if_read_blocked
+        if nt_err := get_nt_namespace_error(raw_path_str, verb="Read"):
+            return 0, None, nt_err
     try:
         resolved = video_path.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         return 0, None, f"Could not resolve video file: {exc}"
     if check_file_safety:
-        from agent.file_safety import raise_if_read_blocked
         try:
             raise_if_read_blocked(str(resolved))
-        except PermissionError as exc:
+        except (PermissionError, ValueError) as exc:
             return 0, None, str(exc)
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd, st, open_err = _open_regular_video_nofollow(resolved)
+    if fd is None or st is None:
+        return 0, None, open_err or "Could not open video file."
     try:
-        fd = os.open(str(resolved), flags)
-    except OSError as exc:
-        return 0, None, f"Could not open video file: {exc}"
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            return 0, None, "Video source is not a regular file."
         if st.st_size > max_raw_bytes:
             return st.st_size, None, (
                 f"Video too large for API: file is {st.st_size / (1024 * 1024):.1f} MB "
@@ -1245,6 +1289,8 @@ async def _materialize_video(
     if not host_feature_enabled("media_processing"):
         raise ValueError("Video processing is not available to a hosted agent.")  # it would cache here
     video_url = (video_url or "").strip()
+    if "\x00" in video_url:
+        raise ValueError("Invalid video source: path contains null byte.")
     lowered = video_url.lower()
     if lowered.startswith("data:"):
         raise ValueError(
@@ -1410,6 +1456,13 @@ async def _video_analyze_native(
     """Fast path for video-capable native Gemini main models: returns a ``_multimodal`` envelope dict."""
     if not isinstance(video_url, str) or not video_url.strip():
         return tool_error("video_url is required", success=False)
+    if "\x00" in video_url:
+        return tool_error("Invalid video source: path contains null byte.", success=False)
+    stripped_url = video_url.strip()
+    if not stripped_url.lower().startswith(("http://", "https://", "data:")):
+        from agent.file_safety import get_nt_namespace_error
+        if nt_err := get_nt_namespace_error(_parse_file_uri(stripped_url), verb="Read"):
+            return tool_error(nt_err, success=False)
     refusal, reserved_key = _reserve_embed(video_url, tool_name="video_analyze", media_label="video")
     if refusal is not None:
         return refusal

@@ -211,3 +211,130 @@ def test_queued_turn_attachment_isolation_in_admit_and_compute_host(tmp_path: Pa
     assert "_turn_attached_documents" not in session
     assert session["attached_documents"] == [live_doc]
     assert session["attached_images"] == [live_img]
+
+    # 4. Queued text-only turn (queued_prompt_generation set, image_paths=None, attached_documents=None)
+    #    must NEVER steal newly staged live composer images or documents.
+    session["agent"] = SimpleNamespace(
+        provider="solstice", model="gemini-4-neon", base_url="", requested_provider="solstice",
+        clear_interrupt=lambda: None,
+    )
+    session["_queued_prompt_generation"] = 7
+    admitted_q = server._admit_prompt_turn(
+        "s-iso", session, "queued text only", None, 7, None, None, attached_documents=None,
+    )
+    assert admitted_q is not None
+    assert admitted_q[0] == []
+    assert session["_turn_attached_documents"] == []
+    assert session["attached_images"] == [live_img]
+    assert session["attached_documents"] == [live_doc]
+
+    frame_q = server._compute_host_turn_frame(
+        "r3", "s-iso", session, "queued text only", queued_prompt_generation=7,
+    )
+    assert frame_q["attached_images"] == []
+    assert frame_q["attached_documents"] == []
+
+
+def test_reset_retry_persist_history_and_pdf_attach_edge_cases(tmp_path: Path, monkeypatch):
+    # 1. /new (_reset_session_agent) clears attached_documents; /retry refuses staged attached_documents with 4018
+    doc = {"path": str(tmp_path / "old.pdf"), "filename": "old.pdf", "mime_type": "application/pdf"}
+    session = _make_session(tmp_path, "s-edge", provider="solstice", model="gemini-4-neon")
+    session["attached_documents"] = [doc]
+    session["history"] = [{"role": "user", "content": "ask"}, {"role": "assistant", "content": "reply"}]
+
+    retry_resp = server._cmd_retry("r-retry", {}, session, "retry", "")
+    assert retry_resp.get("error", {}).get("code") == 4018
+
+    with patch.object(server, "_set_session_context", return_value=[]), \
+         patch.object(server, "_clear_session_context"), \
+         patch.object(server, "_rebuild_session_agent", return_value=session["agent"]), \
+         patch.object(server, "_session_info", return_value={}), \
+         patch.object(server, "_emit"), \
+         patch.object(server, "_restart_slash_worker"):
+        server._reset_session_agent("s-edge", session)
+    assert session["attached_documents"] == []
+
+    # 2. Native-PDF-only persist_user_message drops API-only notes and preserves [document: ...] marker
+    from agent.session_persistence import durable_user_row_content
+    from session_rules.turns import _durable_content
+
+    run_msg = server._prepend_note(
+        [
+            {"type": "text", "text": "Summarize this"},
+            {"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64, "filename": "report.pdf"},
+        ],
+        "[System note: The user interrupted your speech mid-sentence.]",
+    )
+    persist_override = server._build_persist_user_message("Summarize this", [], run_msg)
+    assert isinstance(persist_override, list)
+    durable_c, _ = durable_user_row_content(
+        SimpleNamespace(_persist_user_message_override=persist_override),
+        {"role": "user", "content": run_msg},
+        run_msg,
+        None,
+    )
+    durable_text = _durable_content(durable_c)
+    assert "interrupted your speech" not in durable_text
+    assert "Summarize this" in durable_text and "[document: report.pdf]" in durable_text
+
+    # 3. Combined image + native PDF projects without leaking raw base64 image data URLs
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    img_path = tmp_path / "shot.png"
+    img_path.write_bytes(png_bytes)
+    img_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+    combined_run = [
+        {"type": "text", "text": f"Compare\n\n[Image attached at: {img_path}]"},
+        {"type": "image_url", "image_url": {"url": img_url}},
+        {"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64, "filename": "doc.pdf"},
+    ]
+    persist_both = server._build_persist_user_message("Compare", [str(img_path)], combined_run)
+    projected = server._history_to_messages([{"role": "user", "content": persist_both}], image_urls=True)
+    assert "data:image/png;base64," not in projected[0]["text"]
+    assert f"@image:{img_path}" in projected[0]["text"]
+    assert "[document: doc.pdf]" in projected[0]["text"]
+
+    # 4. pdf.attach returns 5028 (not uncaught exception) on staging error, and works for lazy/compute-host agent=None
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  provider: anthropic\n  default: claude-sonnet-4-5\nagent:\n  pdf_input_mode: native\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    session["agent"] = None
+    server._sessions["s-edge"] = session
+    try:
+        with patch.object(server, "_stage_session_file_attachment", side_effect=PermissionError("disk readonly")):
+            err_resp = server.handle_request({
+                "id": "e1",
+                "method": "pdf.attach",
+                "params": {"session_id": "s-edge", "content_base64": _TINY_PDF_B64, "filename": "ro.pdf"},
+            })
+        assert err_resp.get("error", {}).get("code") == 5028
+
+        ok_resp = server.handle_request({
+            "id": "e2",
+            "method": "pdf.attach",
+            "params": {"session_id": "s-edge", "content_base64": _TINY_PDF_B64, "filename": "lazy.pdf"},
+        })
+        assert ok_resp.get("result", {}).get("native_document") is True
+    finally:
+        server._sessions.pop("s-edge", None)
+
+    # 5. Concurrent pdf.attach during compute-host submit_turn is preserved (only sent docs are removed)
+    doc1 = {"path": str(tmp_path / "d1.pdf"), "filename": "d1.pdf", "mime_type": "application/pdf"}
+    doc2 = {"path": str(tmp_path / "d2.pdf"), "filename": "d2.pdf", "mime_type": "application/pdf"}
+    race_session = _make_session(tmp_path, "s-race", provider="solstice", model="gemini-4-neon")
+    race_session["attached_documents"] = [doc1]
+
+    def _submit_turn(frame, on_complete=None):
+        assert frame["attached_documents"] == [doc1]
+        race_session["attached_documents"].append(doc2)
+
+    with patch.object(server, "_load_dashboard_process_isolation_config", return_value={"turn_isolation": True}), \
+         patch.object(server, "_get_compute_host_supervisor", return_value=SimpleNamespace(submit_turn=_submit_turn)), \
+         patch.object(server, "_session_cwd", return_value=str(tmp_path)), \
+         patch.object(server, "_context_cwd_is_launch_artifact", return_value=False), \
+         patch.object(server, "_session_source", return_value="desktop"), \
+         patch.object(server, "_session_auth_user_id", return_value=None):
+        res = server._submit_prompt_to_compute_host("r-race", "s-race", race_session, "hello")
+    assert "result" in res
+    assert race_session["attached_documents"] == [doc2]

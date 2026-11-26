@@ -1,7 +1,9 @@
 """Native inbound audio/PDF routing and outbound part materialization for the messaging gateway."""
 from __future__ import annotations
 
+import asyncio
 import base64
+import inspect
 import logging
 import mimetypes
 import os
@@ -26,6 +28,42 @@ from tools.media_io import (
 logger = logging.getLogger(__name__)
 
 
+def _is_pdf_candidate(path: str, mtype: str) -> bool:
+    """True when an inbound attachment's MIME type (ignoring ``;params``) or extension indicates a PDF."""
+    base_mime = str(mtype or "").split(";", 1)[0].strip().lower()
+    return base_mime == "application/pdf" or os.path.splitext(path)[1].lower() == ".pdf"
+
+
+def has_native_media_candidates(event: Any, audio_file_paths: list[str]) -> bool:
+    """True when *event* carries any candidate audio file or PDF eligible for native routing."""
+    if audio_file_paths:
+        return True
+    event_urls = list(getattr(event, "media_urls", None) or ())
+    if not event_urls:
+        return False
+    event_types = list(getattr(event, "media_types", None) or ())
+    return any(
+        _is_pdf_candidate(path, event_types[i] if i < len(event_types) else "")
+        for i, path in enumerate(event_urls)
+    )
+
+
+def _resolve_runtime_readonly(runner: Any, *, source: Any, session_key: str) -> tuple[str, dict[str, Any]]:
+    """Invoke ``runner._resolve_session_agent_runtime`` without mutating runner-wide fallback notice slots."""
+    fn = runner._resolve_session_agent_runtime
+    try:
+        params = inspect.signature(fn).parameters
+        accepts_record_notice = (
+            "record_notice" in params
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        )
+    except (TypeError, ValueError):
+        accepts_record_notice = False
+    if accepts_record_notice:
+        return fn(source=source, session_key=session_key, record_notice=False)
+    return fn(source=source, session_key=session_key)
+
+
 def prepare_inbound_native_audio_and_pdfs(
     runner: Any,
     event: Any,
@@ -37,9 +75,11 @@ def prepare_inbound_native_audio_and_pdfs(
 
     Returns ``(remaining_audio_file_paths, native_pdf_paths, queued_attachments)``. Never touches ``MessageType.VOICE`` STT.
     """
+    if not has_native_media_candidates(event, audio_file_paths):
+        return audio_file_paths, set(), []
     try:
-        turn_model, runtime_kwargs = runner._resolve_session_agent_runtime(
-            source=source, session_key=session_key,
+        turn_model, runtime_kwargs = _resolve_runtime_readonly(
+            runner, source=source, session_key=session_key,
         )
         rt = runtime_kwargs or {}
         provider = str(rt.get("provider") or "").strip()
@@ -49,13 +89,13 @@ def prepare_inbound_native_audio_and_pdfs(
         cfg = load_config()
         audio_native = (
             bool(audio_file_paths)
-            and supports_audio_in_user_turns(provider, turn_model, cfg, base_url=base_url)
+            and supports_audio_in_user_turns(provider, turn_model, cfg, base_url=base_url, api_mode=api_mode)
             and decide_audio_input_mode(
                 provider, turn_model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
             ) == "native"
         )
         pdf_native = (
-            bool(event.media_urls)
+            bool(getattr(event, "media_urls", None))
             and supports_pdf_in_user_turns(provider, turn_model, cfg, base_url=base_url, api_mode=api_mode)
             and decide_pdf_input_mode(
                 provider, turn_model, cfg, requested_provider=requested_provider, allow_network=False, base_url=base_url,
@@ -70,6 +110,7 @@ def prepare_inbound_native_audio_and_pdfs(
 
     queued: list[dict[str, str]] = []
     remaining_audio: list[str] = []
+    seen_audio: set[str] = set()
     names = runner._inbound_original_names(event)
     event_urls = list(getattr(event, "media_urls", None) or ())
     event_types = list(getattr(event, "media_types", None) or ())
@@ -81,6 +122,8 @@ def prepare_inbound_native_audio_and_pdfs(
 
     for path in audio_file_paths:
         if audio_native:
+            if path in seen_audio:
+                continue
             head = peek_file_header_nofollow(path, max_file_bytes=MAX_NATIVE_MEDIA_RAW_BYTES)
             if head is not None and is_valid_audio_bytes(head):
                 declared = mime_by_path.get(path, "")
@@ -89,15 +132,17 @@ def prepare_inbound_native_audio_and_pdfs(
                 if mime.startswith("audio/"):
                     display, _ = runner._inbound_attachment_display_name(path, names.get(path, ""))
                     queued.append({"kind": "audio", "path": path, "mime_type": mime, "filename": display})
+                    seen_audio.add(path)
                     continue
         remaining_audio.append(path)
 
     native_pdf_paths: set[str] = set()
     if pdf_native and event_urls:
         for i, path in enumerate(event_urls):
+            if path in native_pdf_paths:
+                continue
             mtype = event_types[i] if i < len(event_types) else ""
-            is_pdf = str(mtype).lower() == "application/pdf" or os.path.splitext(path)[1].lower() == ".pdf"
-            if not is_pdf:
+            if not _is_pdf_candidate(path, mtype):
                 continue
             head = peek_file_header_nofollow(path, max_file_bytes=MAX_NATIVE_MEDIA_RAW_BYTES)
             if head is None or not is_valid_pdf_bytes(head):
@@ -107,6 +152,21 @@ def prepare_inbound_native_audio_and_pdfs(
             native_pdf_paths.add(path)
 
     return remaining_audio, native_pdf_paths, queued
+
+
+async def prepare_inbound_native_media_async(
+    runner: Any,
+    event: Any,
+    source: Any,
+    session_key: str,
+    audio_file_paths: list[str],
+) -> tuple[list[str], set[str], list[dict[str, str]]]:
+    """Event-loop wrapper: skip thread-pool dispatch when *event* has no audio/PDF candidates."""
+    if not has_native_media_candidates(event, audio_file_paths):
+        return audio_file_paths, set(), []
+    return await asyncio.to_thread(
+        prepare_inbound_native_audio_and_pdfs, runner, event, source, session_key, audio_file_paths,
+    )
 
 
 def route_inbound_native_audio_and_pdfs(

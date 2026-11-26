@@ -523,3 +523,147 @@ def test_chat_completions_transport_gating_mixed_rejection_and_corrupt_image_iso
     }]
     assert _strip_images_from_messages(corrupt_retry) is True
     assert [p["type"] for p in corrupt_retry[0]["content"]] == ["text", "video_url", "audio", "document"]
+
+
+def test_tool_result_base64_leak_guard_anthropic_and_bedrock():
+    big_pdf = _TINY_PDF_B64 + "A" * 2000
+    # 1. Anthropic list-typed tool result with document/audio/video (no image) never falls through to json.dumps
+    for part, expected in (
+        ({"type": "document", "mime_type": "application/pdf", "data": big_pdf}, "document omitted"),
+        ({"type": "audio", "mime_type": "audio/mpeg", "data": big_pdf}, "audio omitted"),
+        ({"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{big_pdf}"}}, "video omitted"),
+    ):
+        _, am = convert_messages_to_anthropic([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "Header"}, part]},
+        ])
+        tr_content = am[-1]["content"][0]["content"]
+        assert isinstance(tr_content, str)
+        assert big_pdf not in tr_content
+        assert "Header" in tr_content and expected in tr_content.lower()
+
+    # 2. Bedrock Converse tool result with _multimodal dict uses _durable_content instead of json.dumps
+    _, bm = convert_messages_to_converse([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": {
+            "_multimodal": True,
+            "text_summary": "Attached PDF summary",
+            "content": [{"type": "document", "mime_type": "application/pdf", "data": big_pdf}],
+        }},
+    ])
+    tr_text = bm[-1]["content"][0]["toolResult"]["content"][0]["text"]
+    assert big_pdf not in tr_text and "Attached PDF summary" in tr_text
+
+
+def test_gemini_input_image_param_mime_youtube_guard_and_interactions_string_image_url():
+    # Responses-shape input_image (string image_url) converts cleanly on both generateContent & Interactions
+    resp_img = {"type": "input_image", "image_url": _TINY_1X1_PNG_URL}
+    inline = _inline_data_part(resp_img)
+    assert inline is not None and inline["inlineData"]["mimeType"] == "image/png"
+
+    profile = get_provider_profile("gemini")
+    assert profile is not None
+    pkg = sys.modules[type(profile).__module__].__package__
+    interactions = importlib.import_module(f"{pkg}.interactions")
+    steps, _ = interactions.build_input_steps([{"role": "user", "content": [resp_img]}])
+    assert steps == [{"type": "user_input", "content": [{"type": "image", "mime_type": "image/png", "data": _TINY_1X1_PNG_URL.split(",", 1)[1]}]}]
+
+    # Parameterized document MIME (e.g. "application/pdf; charset=binary") succeeds on both paths
+    param_doc = {"type": "document", "mime_type": "application/pdf; charset=binary", "data": _TINY_PDF_B64}
+    assert _inline_data_part(param_doc) == {"inlineData": {"mimeType": "application/pdf", "data": _TINY_PDF_B64}}
+    assert interactions._document_content(param_doc) == {"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64}
+
+    # Non-video part pointing at a YouTube URL is NOT rewritten into video/mp4 fileData
+    assert _inline_data_part({"type": "image_url", "image_url": {"url": "https://youtu.be/dQw4w9WgXcQ"}}) is None
+
+
+def test_models_dev_sparse_modality_override_and_bool_string_coercion():
+    from agent.image_routing import _lookup_supports_audio, _lookup_supports_pdf
+    from agent.models_dev import get_model_capabilities
+
+    # Setting supports_audio=True on a catalog-miss model leaves vision/video/pdf as None (unknown), not False
+    cfg_aud = {"model_overrides": {"custom": {"unk-model": {"supports_audio": True}}}}
+    caps = get_model_capabilities("custom", "unk-model", allow_network=False, config=cfg_aud)
+    assert caps is not None
+    assert caps.supports_audio is True
+    assert caps.supports_vision is None
+    assert caps.supports_video is None
+    assert caps.supports_pdf is None
+
+    # Setting supports_vision=True on an unindexed Gemini model preserves Gemini audio/PDF fallbacks
+    cfg_vis = {"model_overrides": {"gemini": {"gemini-99-unk": {"supports_vision": True}}}}
+    assert _lookup_supports_audio("gemini", "gemini-99-unk", cfg_vis, allow_network=False) is True
+    assert _lookup_supports_pdf("gemini", "gemini-99-unk", cfg_vis, allow_network=False) is True
+
+    # String "false" for supports_vision coerces to False (not bool("false") == True)
+    cfg_false = {"model_overrides": {"custom": {"unk-model": {"supports_vision": "false"}}}}
+    caps_f = get_model_capabilities("custom", "unk-model", allow_network=False, config=cfg_false)
+    assert caps_f is not None and caps_f.supports_vision is False
+
+
+def test_anthropic_pdf_gating_native_google_v1_and_token_accounting_fixes():
+    from types import SimpleNamespace
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+    from agent.context_compressor_media import extract_media_payloads
+    from agent.image_routing import (
+        is_native_gemini_video_route,
+        supports_audio_in_user_turns,
+        supports_pdf_in_user_turns,
+    )
+    from agent.model_metadata_token_memo import _b64_payload_len, estimate_non_image_media_tokens
+    from agent.turn_recovery import recover_before_classification
+
+    # Non-Anthropic anthropic_messages providers (MiniMax, custom proxy) do NOT advertise PDF support
+    assert supports_pdf_in_user_turns("minimax", "MiniMax-M2.5", {}, api_mode="anthropic_messages") is False
+    assert supports_pdf_in_user_turns("bedrock", "anthropic.claude-sonnet-4-6", {}, api_mode="anthropic_messages") is True
+    assert supports_pdf_in_tool_results("gemini", "gemini-3-pro", {}, api_mode="anthropic_messages") is False
+    assert supports_audio_in_tool_results("gemini", "gemini-3-pro", {}, api_mode="anthropic_messages") is False
+
+    class _MiniMaxAgent(VisionMessagePrepMixin):
+        provider = "minimax"
+        model = "MiniMax-M2.5-unk"
+        api_mode = "anthropic_messages"
+        base_url = "https://api.minimax.io/anthropic"
+        requested_provider = "minimax"
+
+    with patch("hermes_cli.config.load_config", return_value={}):
+        assert _MiniMaxAgent()._model_supports_document() is False
+
+    # Google native /v1 Gemini endpoint is accepted (not falsely rejected as OpenAI-compat /v1)
+    v1_url = "https://generativelanguage.googleapis.com/v1"
+    assert is_native_gemini_video_route("gemini", "gemini-3-pro", {}, base_url=v1_url) is True
+    assert supports_audio_in_user_turns("gemini", "gemini-2.5-pro", {}, base_url=v1_url) is True
+    assert supports_pdf_in_user_turns("gemini", "gemini-2.5-pro", {}, base_url=v1_url) is True
+
+    # api_content sidecar wins -> estimate_non_image_media_tokens returns 0
+    sidecar_msg = {
+        "role": "user",
+        "api_content": "short text",
+        "content": [{"type": "document", "mime_type": "application/pdf", "data": "A" * 400_000}],
+    }
+    assert estimate_non_image_media_tokens(sidecar_msg) == 0
+
+    # Flat input_file file_data is measured by both token memo and eviction payload extractor
+    flat_file = {"type": "input_file", "file_data": f"data:application/pdf;base64,{'A' * 1000}"}
+    assert _b64_payload_len(flat_file) == 1000
+    assert extract_media_payloads([flat_file]) == [flat_file["file_data"]]
+
+    # Watchdog payload char estimator strips audio/document base64
+    big_pdf_payload = {"messages": [{"role": "user", "content": [{"type": "document", "mime_type": "application/pdf", "data": "A" * 4_000_000}]}]}
+    assert estimate_request_context_tokens(big_pdf_payload) < 10_000
+
+    # turn_recovery checks sent wire messages (api_kwargs["messages"]) instead of un-stripped api_messages
+    ag = SimpleNamespace(
+        provider="deepseek", model="deepseek-chat", api_mode="chat_completions",
+        base_url="https://api.deepseek.com/v1", log_prefix="",
+        _image_rejecting_models=set(), _rejected_media_modalities={},
+        _rejected_reasoning_fields={}, _unicode_sanitization_passes=0,
+        _vprint=lambda *a, **k: None,
+    )
+    api_msgs = [{"role": "user", "content": [{"type": "text", "text": "q"}, {"type": "document", "mime_type": "application/pdf", "data": _TINY_PDF_B64}]}]
+    sent_kwargs = {"messages": [{"role": "user", "content": [{"type": "text", "text": "q"}, {"type": "text", "text": "[Document omitted]"}]}]}
+    err = type("E", (Exception,), {"status_code": 400, "body": "echoed 'pdf is not supported'"})()
+    retry_now, _ = recover_before_classification(ag, err, messages=api_msgs, api_messages=api_msgs, api_kwargs=sent_kwargs, active_system_prompt="")
+    assert retry_now is False and ag._rejected_media_modalities == {}

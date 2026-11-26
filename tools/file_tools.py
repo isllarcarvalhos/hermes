@@ -466,35 +466,53 @@ def _try_read_native_pdf(path: str, _resolved, offset: int, task_id: str):
     )
     from tools.vision_tools_history_budget import release_embed_key, reserve_embed
 
+    raw = read_file_bounded_nofollow(str(_resolved), max_bytes=MAX_NATIVE_MEDIA_RAW_BYTES)
+    if raw is None or not is_valid_pdf_bytes(raw):
+        return None
+
     refusal, reserved_key = reserve_embed(str(_resolved), tool_name="read_file", media_label="PDF")
     if refusal is not None:
         return refusal
 
-    raw = read_file_bounded_nofollow(str(_resolved), max_bytes=MAX_NATIVE_MEDIA_RAW_BYTES)
-    if raw is None or not is_valid_pdf_bytes(raw):
-        release_embed_key(reserved_key)
-        return None
-    if pdf_has_redacted_text(
-        raw,
-        lambda text: redact_sensitive_text(text, file_read=True, secret_file=False),
-    ):
-        release_embed_key(reserved_key)
-        return None
-
-    encoded = base64.b64encode(raw).decode("ascii")
-    note = (
-        f"Attached PDF natively ({_resolved.name}, {len(raw)} bytes, native_document: true). "
-        "The full PDF is attached visually for direct inspection; no offset pagination is needed."
-    )
-    return {
-        "_multimodal": True,
-        "meta": {"native_document": True, "filename": _resolved.name, "bytes": len(raw)},
-        "content": [
-            {"type": "text", "text": note},
-            {"type": "document", "mime_type": "application/pdf", "data": encoded, "filename": _resolved.name},
-        ],
-        "text_summary": note,
-    }
+    embedded = False
+    try:
+        if pdf_has_redacted_text(
+            raw,
+            lambda text: redact_sensitive_text(text, file_read=True, secret_file=False),
+        ):
+            return None
+        if reserved_key is None:
+            with _read_tracker_lock:
+                task_data = _task_data(task_id)
+                consecutive = _bump_consecutive(task_data, ("read_pdf", str(_resolved), offset))
+                _cap_read_tracker_data(task_data)
+            if consecutive >= 4:
+                return tool_error(
+                    f"BLOCKED: You have read this exact PDF {consecutive} times in a row. "
+                    "The full PDF is already in your conversation context. "
+                    "STOP re-reading and proceed with your task.",
+                    path=path,
+                    already_read=consecutive,
+                    **{GUARDRAIL_REFUSAL_KEY: True},
+                )
+        encoded = base64.b64encode(raw).decode("ascii")
+        note = (
+            f"Attached PDF natively ({_resolved.name}, {len(raw)} bytes, native_document: true). "
+            "The full PDF is attached visually for direct inspection; no offset pagination is needed."
+        )
+        embedded = True
+        return {
+            "_multimodal": True,
+            "meta": {"native_document": True, "filename": _resolved.name, "bytes": len(raw)},
+            "content": [
+                {"type": "text", "text": note},
+                {"type": "document", "mime_type": "application/pdf", "data": encoded, "filename": _resolved.name},
+            ],
+            "text_summary": note,
+        }
+    finally:
+        if not embedded:
+            release_embed_key(reserved_key)
 
 
 def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str) -> str | dict | None:

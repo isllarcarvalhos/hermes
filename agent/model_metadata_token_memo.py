@@ -26,7 +26,7 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-from session_rules.turns import _AUDIO_PART_TYPES, _DOCUMENT_PART_TYPES
+from session_rules.turns import _AUDIO_PART_TYPES, _DOCUMENT_PART_TYPES, _VIDEO_PART_TYPES
 
 # fingerprint -> (pins, text tokens, image count). Order is recency: a hit moves its entry to the end, and an
 # OrderedDict evicts from the front in O(1) where a plain dict rescans its deleted slots on every eviction.
@@ -132,9 +132,13 @@ def forget_message_token_memo(messages: Any, *, keep: Any = None) -> int:
 
 
 def _b64_payload_len(part: dict[str, Any]) -> int:
-    """Character length of the base64 payload inside an audio/document part, minus any data: prefix."""
-    candidates = [part.get("data")]
-    for key, inner in (("input_audio", "data"), ("file", "file_data"), ("audio_url", "url"), ("document_url", "url"), ("source", "data")):
+    """Character length of the base64 payload inside a non-image media part, minus any data: prefix."""
+    candidates = [part.get("data"), part.get("file_data")]
+    for key, inner in (
+        ("input_audio", "data"), ("file", "file_data"), ("audio_url", "url"),
+        ("document_url", "url"), ("source", "data"), ("video_url", "url"),
+        ("input_video", "url"), ("video", "url"),
+    ):
         obj = part.get(key)
         candidates.append(obj.get(inner) if isinstance(obj, dict) else (obj if isinstance(obj, str) else None))
     for val in candidates:
@@ -143,17 +147,24 @@ def _b64_payload_len(part: dict[str, Any]) -> int:
                 _, sep, rest = val.partition(",")
                 if sep:
                     return len(rest)
+            if val.startswith(("http://", "https://")):
+                return 0
             return len(val)
     return 0
 
 
 def estimate_non_image_media_tokens(msg: Any) -> int:
-    """Conservative non-EMA token estimate for native audio and document parts.
+    """Conservative non-EMA token estimate for native video, audio, and document parts.
 
-    Kept separate from ``_count_image_tokens`` so audio/PDF token deltas never poison
+    Kept separate from ``_count_image_tokens`` so video/audio/PDF token deltas never poison
     ``image_token_costs.json`` EMA calibration.
     """
     if not isinstance(msg, dict):
+        return 0
+    # Mirror ``_wire_message_shadow``: a non-empty string ``api_content`` sidecar on a user/assistant
+    # row replaces ``content`` on the wire, so media in ``content`` never reaches the provider.
+    sidecar = msg.get("api_content")
+    if isinstance(sidecar, str) and bool(sidecar) and msg.get("role") in ("user", "assistant"):
         return 0
     part_lists: list[list[Any]] = []
     content = msg.get("content")
@@ -169,7 +180,10 @@ def estimate_non_image_media_tokens(msg: Any) -> int:
             if not isinstance(p, dict):
                 continue
             ptype = p.get("type")
-            if ptype in _AUDIO_PART_TYPES:
+            if ptype in _VIDEO_PART_TYPES:
+                raw_bytes = (_b64_payload_len(p) * 3) // 4
+                total += min(32_000, max(1_500, raw_bytes // 512))
+            elif ptype in _AUDIO_PART_TYPES:
                 raw_bytes = (_b64_payload_len(p) * 3) // 4
                 total += min(32_000, max(1_000, raw_bytes // 1024))
             elif ptype in _DOCUMENT_PART_TYPES:

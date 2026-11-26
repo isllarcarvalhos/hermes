@@ -71,6 +71,7 @@ def extract_media_payloads(parts: Any, *, images_only: bool = False) -> list[str
             or (source_obj.get("data") if isinstance(source_obj, dict) else None)
             or (input_audio_obj.get("data") if isinstance(input_audio_obj, dict) else None)
             or (file_obj.get("file_data") if isinstance(file_obj, dict) else None)
+            or part.get("file_data")
             or part.get("data")
         )
         sources.append(data if isinstance(data, str) else "")

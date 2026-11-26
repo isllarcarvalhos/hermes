@@ -535,5 +535,51 @@ class TestNativeVideoFastPath:
                 assert ref2 is not None and key2 is None
                 assert "video_analyze refused: this video" in ref2
 
+    def test_nt_namespace_nul_and_read_blocked_video_guards(self, tmp_path):
+        """NT-namespace paths never reach Path.resolve(); NUL bytes return tool_error; blocked .env returns error tuple."""
+        import os
+        from pathlib import Path
+        from tools.vision_tools import (
+            _read_and_encode_video_bounded,
+            _video_analyze_native,
+            _vision_analyze_native,
+        )
+
+        resolved_calls: list[str] = []
+        orig_resolve = Path.resolve
+
+        def spy_resolve(self, *args, **kwargs):
+            resolved_calls.append(str(self))
+            return orig_resolve(self, *args, **kwargs)
+
+        nt_unc = r"\\?\UNC\attacker.example\share\clip.mp4"
+        with (
+            patch("tools.vision_tools_history_budget.resolve_repeat_cap", return_value=3),
+            patch.object(Path, "resolve", spy_resolve),
+        ):
+            r_vid = asyncio.run(_video_analyze_native(nt_unc, "describe"))
+            r_img = asyncio.run(_vision_analyze_native(nt_unc, "describe"))
+            r_nul = asyncio.run(_video_analyze_native("bad\x00path.mp4", "describe"))
+
+        assert not any("attacker.example" in p for p in resolved_calls)
+        assert json.loads(r_vid)["success"] is False
+        assert json.loads(r_img)["success"] is False
+        assert json.loads(r_nul)["success"] is False
+
+        env_file = tmp_path / ".env"
+        env_file.write_bytes(b"SECRET=123\n")
+        _sz, data_url, err = _read_and_encode_video_bounded(
+            env_file, "video/mp4", max_raw_bytes=1024, max_base64_bytes=2048
+        )
+        assert data_url is None and err and "Access denied" in err
+
+        if hasattr(os, "mkfifo"):
+            fifo = tmp_path / "pipe.mp4"
+            os.mkfifo(fifo)
+            _sz2, data_url2, err2 = _read_and_encode_video_bounded(
+                fifo, "video/mp4", max_raw_bytes=1024, max_base64_bytes=2048, check_file_safety=False
+            )
+            assert data_url2 is None and err2 and "regular file" in err2.lower()
+
 
 

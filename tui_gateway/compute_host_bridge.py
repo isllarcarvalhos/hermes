@@ -54,7 +54,9 @@ def _compute_host_turn_frame(
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
-        consume_live = image_paths is None and attached_documents is None
+        consume_live = (
+            image_paths is None and attached_documents is None and queued_prompt_generation is None
+        )
         attached_images = list(session.get("attached_images", []) if consume_live else (image_paths or []))
         attached_docs = list(session.get("attached_documents", []) if consume_live else (attached_documents or []))
     return {
@@ -355,9 +357,17 @@ def _submit_prompt_to_compute_host(
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
-        if image_paths is None and attached_documents is None:
-            session["attached_images"] = []
-            session["attached_documents"] = []
+        if image_paths is None and attached_documents is None and queued_prompt_generation is None:
+            live_imgs = list(session.get("attached_images", []))
+            for sent_img in frame.get("attached_images") or ():
+                if sent_img in live_imgs:
+                    live_imgs.remove(sent_img)
+            session["attached_images"] = live_imgs
+            live_docs = list(session.get("attached_documents", []))
+            for sent_doc in frame.get("attached_documents") or ():
+                if sent_doc in live_docs:
+                    live_docs.remove(sent_doc)
+            session["attached_documents"] = live_docs
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 

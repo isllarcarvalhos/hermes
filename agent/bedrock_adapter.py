@@ -1039,7 +1039,7 @@ def convert_messages_to_converse(
         elif role == "tool":
             if isinstance(content, str):
                 result_content = content
-            elif isinstance(content, list):
+            elif isinstance(content, list) or (isinstance(content, dict) and content.get("_multimodal")):
                 result_content = _durable_content(content) or ""
             else:
                 result_content = json.dumps(content)

@@ -1807,9 +1807,9 @@ class GatewayInboundMixin(
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
-        from gateway.run_inbound_native_media import prepare_inbound_native_audio_and_pdfs
-        audio_file_paths, native_pdf_paths, queued_native_media = await asyncio.to_thread(
-            prepare_inbound_native_audio_and_pdfs, self, event, source, session_key, audio_file_paths)
+        from gateway.run_inbound_native_media import prepare_inbound_native_media_async
+        audio_file_paths, native_pdf_paths, queued_native_media = await prepare_inbound_native_media_async(
+            self, event, source, session_key, audio_file_paths)
         if queued_native_media:
             self._session_state(session_key).persistent.native_media_attachments = queued_native_media
         message_text = self._prepend_inbound_media_file_notes(

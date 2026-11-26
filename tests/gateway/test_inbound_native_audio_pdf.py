@@ -109,3 +109,63 @@ def test_turn_runner_native_media_materialization(tmp_path: Path):
     tr._ctx = SimpleNamespace(session_key="s1", message="Summarize")
     fb = tr._native_image_run_message()
     assert isinstance(fb, str) and "gone.pdf" in fb and "Summarize" in fb
+
+
+def test_gateway_native_media_preserves_fallback_notice_api_mode_mime_and_dedupe(tmp_path: Path):
+    from gateway.run_inbound_native_media import prepare_inbound_native_audio_and_pdfs
+
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt ")
+    blob_pdf = tmp_path / "cached_blob_no_ext"
+    blob_pdf.write_bytes(_TINY_PDF)
+    dup_pdf = tmp_path / "dup.pdf"
+    dup_pdf.write_bytes(_TINY_PDF)
+
+    calls: list[bool] = []
+
+    class _NoticeRunner(GatewayInboundMixin):
+        def __init__(self, provider: str, model: str, api_mode: str = "chat_completions"):
+            self._provider = provider
+            self._model = model
+            self._api_mode = api_mode
+            self._pre_agent_fallback_notice = "KEEP_ME"
+
+        def _resolve_session_agent_runtime(self, *, source=None, session_key=None, record_notice: bool = True):
+            calls.append(record_notice)
+            if record_notice:
+                self._pre_agent_fallback_notice = None
+            return self._model, {
+                "provider": self._provider,
+                "base_url": "",
+                "requested_provider": self._provider,
+                "api_mode": self._api_mode,
+            }
+
+    # 1. Text-only message short-circuits without touching runtime resolution or _pre_agent_fallback_notice
+    r_text = _NoticeRunner("solstice", "gemini-4-neon")
+    empty_event = SimpleNamespace(media_urls=[], media_types=[], media_filenames=[])
+    assert prepare_inbound_native_audio_and_pdfs(r_text, empty_event, None, "s-empty", []) == ([], set(), [])
+    assert calls == []
+    assert r_text._pre_agent_fallback_notice == "KEEP_ME"
+
+    with patch("hermes_cli.config.load_config", return_value={"agent": {"audio_input_mode": "native", "pdf_input_mode": "native"}}):
+        # 2. Candidate audio on codex_responses api_mode passes record_notice=False AND respects api_mode gate
+        r_codex = _NoticeRunner("google", "gemini-2.5-flash", api_mode="codex_responses")
+        evt_wav = SimpleNamespace(media_urls=[str(wav)], media_types=["audio/wav"], media_filenames=["a.wav"])
+        rem, pdfs, queued = prepare_inbound_native_audio_and_pdfs(r_codex, evt_wav, None, "s-wav", [str(wav)])
+        assert calls == [False]
+        assert r_codex._pre_agent_fallback_notice == "KEEP_ME"
+        assert rem == [str(wav)] and pdfs == set() and queued == []
+
+        # 3. Parameterized PDF MIME ("application/pdf; charset=binary") on extensionless blob + duplicate URL dedupe
+        r_sol = _NoticeRunner("solstice", "gemini-4-neon")
+        evt_pdfs = SimpleNamespace(
+            media_urls=[str(blob_pdf), str(dup_pdf), str(dup_pdf)],
+            media_types=["application/pdf; charset=binary", "application/pdf", "application/pdf"],
+            media_filenames=["report.pdf", "dup.pdf", "dup.pdf"],
+        )
+        rem2, pdfs2, queued2 = prepare_inbound_native_audio_and_pdfs(r_sol, evt_pdfs, None, "s-pdf", [])
+        assert rem2 == []
+        assert pdfs2 == {str(blob_pdf), str(dup_pdf)}
+        assert len(queued2) == 2
+        assert [q["path"] for q in queued2] == [str(blob_pdf), str(dup_pdf)]

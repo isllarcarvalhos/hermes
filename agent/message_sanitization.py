@@ -366,6 +366,22 @@ def serialized_messages_bytes(messages: list) -> int:
         return sum(len(str(m)) for m in messages)
 
 
+def _removed_media_label(removed_types: set[str], fallback: str) -> str:
+    """Infer an accurate modality label when stripping mixed/all media types."""
+    if fallback != "auto":
+        return fallback
+    hits = [
+        name for name, mtypes in (
+            ("image", _IMAGE_PART_TYPES),
+            ("video", _VIDEO_PART_TYPES),
+            ("audio", _AUDIO_PART_TYPES),
+            ("document", _DOCUMENT_PART_TYPES),
+        )
+        if removed_types & mtypes
+    ]
+    return hits[0] if len(hits) == 1 else "media"
+
+
 def _strip_media_types_from_messages(
     messages: list,
     media_types: frozenset[str],
@@ -383,15 +399,22 @@ def _strip_media_types_from_messages(
         content = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(content, list):
             continue
-        new_parts = [p for p in content if not (isinstance(p, dict) and p.get("type") in media_types)]
-        if len(new_parts) < len(content):
+        new_parts = []
+        removed_types: set[str] = set()
+        for p in content:
+            if isinstance(p, dict) and p.get("type") in media_types:
+                removed_types.add(str(p.get("type")))
+            else:
+                new_parts.append(p)
+        if removed_types:
             found = True
             if new_parts:
                 msg["content"] = new_parts
                 # Rewriting a stamped live dict stales its persisted row; pop the marker.
                 msg.pop(_DB_PERSISTED_MARKER, None)
             elif msg.get("role") == "tool" or msg.get("tool_calls") or (preserve_empty_user and msg.get("role") == "user"):
-                msg["content"] = f"[{label} content removed — server does not support {label} input]"
+                eff_label = _removed_media_label(removed_types, label)
+                msg["content"] = f"[{eff_label} content removed — server does not support {eff_label} input]"
                 msg.pop(_DB_PERSISTED_MARKER, None)
             else:
                 to_delete.append(i)
@@ -414,7 +437,9 @@ def _strip_images_from_messages(messages: list) -> bool:
 
 def _strip_all_media_from_messages(messages: list) -> bool:
     """Remove all media content parts (image, video, audio, document) for a text-only rejecting model."""
-    return _strip_media_types_from_messages(messages, _ALL_MEDIA_PART_TYPES, label="image")
+    return _strip_media_types_from_messages(
+        messages, _ALL_MEDIA_PART_TYPES, label="auto", preserve_empty_user=True,
+    )
 
 
 # Provider error bodies (lowercased substring match) meaning "image/multimodal input
@@ -472,6 +497,13 @@ _EXPLICIT_IMAGE_REJECTION_PHRASES = tuple(
     p for p in _IMAGE_REJECTION_PHRASES if p not in _GENERIC_CONTENT_REJECTION_PHRASES
 )
 
+_VIDEO_REJECTION_PHRASES = (
+    "video is not supported", "videos are not supported", "video content is not supported",
+    "video input is not supported", "does not support video", "model does not support video",
+    "video_url is not supported", "input_video is not supported",
+    "unknown variant `video_url`", "unknown variant `input_video`", "unknown variant `video`",
+)
+
 _AUDIO_REJECTION_PHRASES = (
     "audio is not supported", "audio content is not supported", "audio input is not supported",
     "does not support audio", "model does not support audio", "input_audio is not supported",
@@ -494,10 +526,24 @@ def _rejected_modalities_map(agent: Any) -> dict[tuple[str, str], set[str]]:
     return mod_map
 
 
+def _parts_carry_media_types(parts: Any, media_types: frozenset[str]) -> bool:
+    if not isinstance(parts, list):
+        return False
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        ptype = p.get("type")
+        if ptype in media_types:
+            return True
+        if ptype == "tool_result" and _parts_carry_media_types(p.get("content"), media_types):
+            return True
+    return False
+
+
 def _messages_carry_media_types(messages: Any, media_types: frozenset[str]) -> bool:
     return isinstance(messages, list) and any(
-        isinstance(m, dict) and isinstance(m.get("content"), list)
-        and any(isinstance(p, dict) and p.get("type") in media_types for p in m["content"])
+        isinstance(m, dict)
+        and (_parts_carry_media_types(m.get("content"), media_types) or _parts_carry_media_types(m.get("output"), media_types))
         for m in messages
     )
 
@@ -509,7 +555,7 @@ def strip_images_for_rejecting_model(agent: Any, api_messages: Any) -> bool:
     provider-specific conversion: the part types this stripper knows are that format's, and a
     converted payload (Bedrock Converse ``{"image": ...}`` blocks carry no ``type``) would slip
     past it. History is never touched. Keyed on each rejecting (provider, model), so a model
-    that accepts images gets them again, and PDF/audio rejection never blinds vision.
+    that accepts images gets them again, and video/PDF/audio rejection never blinds vision.
     """
     if not isinstance(api_messages, list):
         return False
@@ -520,14 +566,15 @@ def strip_images_for_rejecting_model(agent: Any, api_messages: Any) -> bool:
     if not mods:
         return False
     stripped = False
-    if "audio" in mods:
-        stripped |= _strip_media_types_from_messages(
-            api_messages, _AUDIO_PART_TYPES, label="audio", preserve_empty_user=True,
-        )
-    if "document" in mods:
-        stripped |= _strip_media_types_from_messages(
-            api_messages, _DOCUMENT_PART_TYPES, label="document", preserve_empty_user=True,
-        )
+    for name, mtypes in (
+        ("video", _VIDEO_PART_TYPES),
+        ("audio", _AUDIO_PART_TYPES),
+        ("document", _DOCUMENT_PART_TYPES),
+    ):
+        if name in mods:
+            stripped |= _strip_media_types_from_messages(
+                api_messages, mtypes, label=name, preserve_empty_user=True,
+            )
     return stripped
 
 
@@ -540,6 +587,12 @@ def _looks_like_image_content_rejection(error_body: str) -> bool:
     """Return True when a provider error says image/multimodal input is unsupported."""
     body = str(error_body or "").lower()
     return any(phrase in body for phrase in _IMAGE_REJECTION_PHRASES)
+
+
+def _looks_like_video_content_rejection(error_body: str) -> bool:
+    """Return True when a provider error says video input is unsupported."""
+    body = str(error_body or "").lower()
+    return any(phrase in body for phrase in _VIDEO_REJECTION_PHRASES)
 
 
 def _looks_like_audio_content_rejection(error_body: str) -> bool:
@@ -561,31 +614,37 @@ def _looks_like_corrupt_image_rejection(error_body: str) -> bool:
 
 
 def record_media_rejection(agent: Any, error_body: str, messages: Any) -> str | None:
-    """Record a model's media rejection per modality so PDF/audio errors never poison vision.
+    """Record a model's media rejection per modality so video/PDF/audio errors never poison vision.
 
-    Returns the rejected modality label (``"audio"``, ``"document"``, ``"image"``, etc.) or ``None``.
+    Returns the rejected modality label (``"video"``, ``"audio"``, ``"document"``, ``"image"``, etc.) or ``None``.
     """
     key = _provider_model_key(agent)
     mod_map = _rejected_modalities_map(agent)
     rejected_mods = mod_map.get(key, set())
-    if _looks_like_audio_content_rejection(error_body) and "audio" not in rejected_mods and _messages_carry_media_types(messages, _AUDIO_PART_TYPES):
-        mod_map.setdefault(key, set()).add("audio")
-        return "audio"
-    if _looks_like_document_content_rejection(error_body) and "document" not in rejected_mods and _messages_carry_media_types(messages, _DOCUMENT_PART_TYPES):
-        mod_map.setdefault(key, set()).add("document")
-        return "document"
+    for name, detector, mtypes in (
+        ("video", _looks_like_video_content_rejection, _VIDEO_PART_TYPES),
+        ("audio", _looks_like_audio_content_rejection, _AUDIO_PART_TYPES),
+        ("document", _looks_like_document_content_rejection, _DOCUMENT_PART_TYPES),
+    ):
+        if detector(error_body) and name not in rejected_mods and _messages_carry_media_types(messages, mtypes):
+            mod_map.setdefault(key, set()).add(name)
+            return name
     if not _looks_like_image_content_rejection(error_body):
         return None
     body_low = str(error_body or "").lower()
     is_generic_only = not any(phrase in body_low for phrase in _EXPLICIT_IMAGE_REJECTION_PHRASES)
     unrejected_non_image = [
-        name for name, mtypes in (("audio", _AUDIO_PART_TYPES), ("document", _DOCUMENT_PART_TYPES))
+        name for name, mtypes in (
+            ("video", _VIDEO_PART_TYPES),
+            ("audio", _AUDIO_PART_TYPES),
+            ("document", _DOCUMENT_PART_TYPES),
+        )
         if name not in rejected_mods and _messages_carry_media_types(messages, mtypes)
     ]
     if is_generic_only and unrejected_non_image:
         mod_map.setdefault(key, set()).update(unrejected_non_image)
         return "/".join(unrejected_non_image)
-    if not _messages_carry_media_types(messages, _IMAGE_PART_TYPES | _VIDEO_PART_TYPES):
+    if not _messages_carry_media_types(messages, _IMAGE_PART_TYPES):
         if unrejected_non_image:
             mod_map.setdefault(key, set()).update(unrejected_non_image)
             return "/".join(unrejected_non_image)

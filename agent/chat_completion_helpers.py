@@ -54,7 +54,7 @@ from agent.repetition_guard import RunawayStreamWatch, is_repetition_dominated
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool_lifecycle import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
-from session_rules.turns import _IMAGE_PART_TYPES, _VIDEO_PART_TYPES
+from session_rules.turns import _ALL_MEDIA_PART_TYPES
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
@@ -384,7 +384,7 @@ def _payload_chars(value: Any, image_cost: int) -> int:
         part_type = value.get("type")
         # JSON-Schema nodes may hold a sub-schema (``properties.type``) or a multi-type list
         # under the "type" key; only scalar content-part types can ever match (#104793).
-        if isinstance(part_type, str) and (part_type in _IMAGE_PART_TYPES or part_type in _VIDEO_PART_TYPES) and any(k in value for k in ("image_url", "image", "video_url", "input_video", "video", "source", "file_id")):
+        if isinstance(part_type, str) and part_type in _ALL_MEDIA_PART_TYPES and any(k in value for k in ("image_url", "image", "video_url", "input_video", "video", "audio_url", "input_audio", "audio", "document_url", "file", "file_data", "data", "source", "file_id")):
             return _image_part_chars(value, image_cost)
         return sum(len(str(k)) + 6 + _payload_chars(v, image_cost) for k, v in value.items())
     if isinstance(value, list):

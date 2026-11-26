@@ -376,10 +376,10 @@ def _inline_data_part(item: dict[str, Any]) -> Optional[dict[str, Any]]:
     # Direct {type: "audio"|"document", mime_type: ..., data: <raw_b64>} or Anthropic document source shape
     if part_type in ("audio", "document"):
         if isinstance(item.get("data"), str):
-            mime = str(item.get("mime_type") or item.get("media_type") or "").strip().lower()
+            mime = str(item.get("mime_type") or item.get("media_type") or "").split(";", 1)[0].strip().lower()
             raw_b64 = item["data"]
         elif part_type == "document" and isinstance(src := item.get("source"), dict) and src.get("type") == "base64" and isinstance(src.get("data"), str):
-            mime = str(src.get("media_type") or src.get("mime_type") or "").strip().lower()
+            mime = str(src.get("media_type") or src.get("mime_type") or "").split(";", 1)[0].strip().lower()
             raw_b64 = src["data"]
         else:
             mime, raw_b64 = "", ""
@@ -398,11 +398,11 @@ def _inline_data_part(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         if parsed and parsed[0] in _DOCUMENT_INLINE_MIMES:
             return {"inlineData": {"mimeType": parsed[0], "data": parsed[1]}}
         return None
-    payload = item.get(part_type)
+    payload = (item.get("image_url") or item.get("input_image")) if part_type == "input_image" else item.get(part_type)
     url = (payload.get("url") if isinstance(payload, dict) else payload) or item.get("url") or ""
     if not isinstance(url, str):
         return None
-    if yt_url := normalize_youtube_url(url):
+    if part_type in ("video_url", "input_video") and (yt_url := normalize_youtube_url(url)):
         return {"fileData": {"fileUri": yt_url, "mimeType": "video/mp4"}}
     parsed = _parse_data_url(url)
     if not parsed:
