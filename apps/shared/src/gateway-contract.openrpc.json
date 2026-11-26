@@ -39758,6 +39758,18 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Limit"
           }
         },
         "required": [
