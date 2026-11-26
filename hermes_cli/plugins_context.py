@@ -59,9 +59,12 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
     def has_plugin(self, plugin_id: str) -> bool:
         """Return True when another plugin is loaded and enabled (runtime probe for advisory
         ``requires_plugins``, #64165). Matches on registry key or manifest name."""
+        # Snapshot ``_plugins`` before iterating: a concurrent plugin-load callback can mutate the
+        # parent's registry mid-loop and raise ``RuntimeError: dictionary changed size during
+        # iteration`` (#137439). ``list(items)`` is the cheapest take-a-copy that keeps insertion order.
         return any(
             loaded.enabled and (key == plugin_id or loaded.manifest.name == plugin_id)
-            for key, loaded in self._manager._plugins.items()
+            for key, loaded in list(self._manager._plugins.items())
         )
 
     def _segments(self, key: str) -> tuple[str, ...]:
