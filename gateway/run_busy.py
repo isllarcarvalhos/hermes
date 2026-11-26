@@ -960,11 +960,51 @@ class GatewayBusySessionMixin:
                 return True
             return False  # base adapter queues silently behind the active turn
 
+        # Plugin hooks normally run on the idle path inside _handle_message.
+        # The busy path bypasses that, so handover / listen-only / ambient-buffer
+        # plugins never get a chance to silence an inbound that arrives while
+        # an agent is mid-run (the user types during a customer handover,
+        # owner sends an aside, etc.).  Consult pre_gateway_dispatch BEFORE
+        # the authorization gate — same contract as the idle path — so plugins
+        # can skip unauthorized senders without falling into pairing/drop.
+        # Other return shapes (rewrite/allow) are intentionally NOT honored on
+        # the busy path: rewriting an event we're about to interrupt with is
+        # racy, and the only consumer that emits skip today is gateway-policy
+        # (handover / listen-only).  allow / no-action fall through to auth.
+        is_internal = bool(getattr(event, "internal", False))
+        if not is_internal:
+            try:
+                from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
+                _hook_results = await _ainvoke_hook(
+                    "pre_gateway_dispatch",
+                    event=event,
+                    gateway=self,
+                    session_store=self.session_store,
+                )
+            except Exception as _hook_exc:
+                logger.warning("pre_gateway_dispatch (busy path) invocation failed: %s", _hook_exc, exc_info=True)
+                _hook_results = []
+
+            for _result in _hook_results or []:
+                if not isinstance(_result, dict):
+                    continue
+                if _result.get("action") == "skip":
+                    _platform_str = getattr(event.source.platform, "value", None) or "unknown"
+                    logger.info(
+                        "pre_gateway_dispatch skip (busy path): reason=%s platform=%s chat=%s",
+                        _result.get("reason"),
+                        _platform_str,
+                        getattr(event.source, "chat_id", None) or "unknown",
+                    )
+                    return True
+
         # Same authorization gate as the cold path, else unauthorized users in shared threads
         # inject messages into a session they don't own.
         from gateway.run import _AGENT_PENDING_SENTINEL
         # See #17775. A primary transport can route a turn into a secondary
         # profile, so authorize in the stamped transport scope.
+        # Runs after pre_gateway_dispatch so a plugin `skip` can still handle
+        # unauthorized senders (e.g. customer handover ingest) without auth drop.
         if not self._is_user_authorized_for_source(event.source):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
