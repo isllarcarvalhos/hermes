@@ -29,7 +29,17 @@ The pipeline:
 4. stores durable job state and sink records locally
 5. can write summaries to Notion, Linear, and Microsoft Teams
 
-Operator actions stay in the CLI (the `teams-pipeline` subcommand is registered by the `teams_pipeline` plugin — enable it via `hermes plugins enable teams_pipeline` or set `plugins.enabled: [teams_pipeline]` in `config.yaml`):
+The pipeline ships as the official [`teams-pipeline`](https://github.com/NousResearch/hermes-official-plugins/tree/main/teams-pipeline) catalog plugin (opt-in, not installed by default). Install it first; it registers the `teams-pipeline` CLI and binds itself to the core `msgraph_webhook` adapter:
+
+```bash
+hermes plugins install teams-pipeline --enable
+```
+
+Profiles that already had the formerly bundled `teams_pipeline` plugin enabled get the catalog plugin installed and enabled automatically by `hermes update` (or on the next agent or gateway start); `teams_pipeline` keeps working as an alias in `plugins.enabled` / `plugins.disabled`.
+
+The plugin binds to the webhook adapter in-process, so it needs `plugins.isolation: in_process` (the default). Under `plugins.isolation: host` it does not load: meeting notifications are acknowledged but not processed (a profile that enables the pipeline never turns them into agent turns), and `hermes teams-pipeline` is unavailable. The migration, every gateway start and the first dropped notification say so.
+
+Operator actions stay in the CLI:
 
 ```bash
 hermes teams-pipeline validate
