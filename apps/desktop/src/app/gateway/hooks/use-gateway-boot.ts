@@ -17,6 +17,7 @@ import { shouldApplyPostBootProgressError } from '@/components/boot-failure-reau
 import type { DesktopBootProgress, HermesConnection, HermesWindowState } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
+import { bootStepCopy } from '@/lib/boot-copy'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import {
   decideLivenessForceClose,
@@ -71,6 +72,7 @@ import {
   isCurrentGatewaySwitch,
   registerGatewaySwitchLifecycle
 } from '@/store/gateway-switch'
+import { forgetItemIndexOwner } from '@/store/item-index'
 import { watchLocalRuntimeJobs } from '@/store/local-runtime-jobs'
 import { notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
 import { startPresenceReporter } from '@/store/presence'
@@ -1192,7 +1194,7 @@ export function useGatewayBoot({
 
     setDesktopBootStep({
       phase: 'renderer.boot',
-      message: translateNow('boot.steps.startingDesktopConnection'),
+      message: bootStepCopy('startingDesktopConnection'),
       progress: 6
     })
 
@@ -1533,6 +1535,7 @@ export function useGatewayBoot({
         // owner hints naming it so its sessions are not pinned (fail-closed)
         // to a route that no longer exists.
         forgetSessionOwnerHintsForConnection(payload.connectionId)
+        forgetItemIndexOwner(payload.connectionId)
       }
     })
 
