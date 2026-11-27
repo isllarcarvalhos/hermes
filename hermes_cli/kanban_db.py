@@ -2168,39 +2168,21 @@ def _claim_and_open_run(
     return run_id
 
 
+def authorize_continuation(conn, task_id, **kwargs):
+    """Explicit operator authorization; see ``kanban_continuation``."""
+    from hermes_cli.kanban_continuation import authorize_continuation as authorize
+    return authorize(conn, task_id, **kwargs)
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
+    continuation_id: Optional[int] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
-
-    Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not ``ready``, or no longer ``expect_assignee``'s).
-    """
-    now = int(time.time())
-    lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
-        # Single enforcement point: never ready -> running with an undone
-        # parent, whichever writer set 'ready'. Demote to 'todo';
-        # recompute_ready re-promotes when the parents finish.
-        if not _parents_satisfied(conn, task_id):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'", (task_id,),
-            )
-            _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
-            return None
-        # Close a leaked prior run so the CAS below doesn't strand it.
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
-        )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now, expect_assignee=expect_assignee)
-        if run_id is None:
-            return None
-        claimed = get_task(conn, task_id)
-    _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
-    return claimed
+    """Atomic ready -> running, retaining assignee CAS and one-use continuation."""
+    from hermes_cli.kanban_continuation import claim_ready_task
+    return claim_ready_task(conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
+                            expect_assignee=expect_assignee, continuation_id=continuation_id)
 
 
 def claim_review_task(
@@ -3732,15 +3714,23 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    require_fresh_triage: bool = False,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+    Decomposer callers require fresh intake under the same write transaction;
+    explicit specification of an existing card keeps its current behavior.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if require_fresh_triage:
+            from hermes_cli.kanban_db_graph import is_fresh_triage_task
+
+            if not is_fresh_triage_task(conn, task_id):
+                return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
