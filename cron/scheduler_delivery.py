@@ -25,10 +25,10 @@ logger = logging.getLogger("cron.scheduler")
 
 
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
-# Plugin platforms are known through ``PlatformEntry.cron_deliver_env_var``; these rows have none:
-# ``webhook`` is core-only and ``wecom_callback`` (a ``wecom`` plugin sibling) delivers only to its
-# config.yaml ``home_channel``.
-_KNOWN_DELIVERY_PLATFORMS = frozenset({"webhook", "wecom_callback"})
+# Plugin platforms are known through ``PlatformEntry.cron_deliver_env_var``, or as registered plugin
+# platforms that deliver only to their config.yaml ``home_channel`` (WeCom callback); ``webhook`` is
+# core-only and has neither.
+_KNOWN_DELIVERY_PLATFORMS = frozenset({"webhook"})
 
 # Gateway platforms whose adapter declares ``supports_async_delivery = False`` (request/response
 # only, ``send()`` is a stub) — a cron report can never reach them, so they are never a
@@ -423,9 +423,28 @@ def _plugin_cron_env_var(platform_name: str) -> str:
 
 
 def _is_known_delivery_platform(platform_name: str) -> bool:
-    """Valid cron delivery platform: built-in, or plugin with a ``cron_deliver_env_var``."""
+    """Valid cron delivery platform: built-in, a plugin with a ``cron_deliver_env_var``, or a
+    registered plugin platform (its home target then comes from config.yaml only)."""
     name = platform_name.lower()
-    return name in _KNOWN_DELIVERY_PLATFORMS or bool(_plugin_cron_env_var(name))
+    return name in _KNOWN_DELIVERY_PLATFORMS or bool(_plugin_cron_env_var(name)) or _registered_plugin_platform(name)
+
+
+def _registered_plugin_platform(name: str) -> bool:
+    with contextlib.suppress(Exception):
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(name)
+        return entry is not None and entry.source == "plugin"
+    return False
+
+
+def moved_platform_hint(platform_name: str) -> str:
+    """``". <label> moved out of core into the '<plugin>' plugin: install it with `<command>`"`` for a
+    platform that left core whose plugin is not loaded, else ``""``: a route saved while core shipped it
+    names the install instead of failing as an unknown target."""
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.left_core_migration import platform_install_hint
+    name = platform_name.strip().lower()
+    return "" if platform_registry.get(name) else platform_install_hint(name)
 
 
 def _resolve_home_env_var(platform_name: str) -> str:
@@ -1715,7 +1734,8 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
             "skipping delivery (output saved in last_output)",
             job.get("name", job.get("id", "?")))
         return None
-    msg = f"no delivery target resolved for deliver={deliver_value}"
+    hints = "".join(moved_platform_hint(part.split(":", 1)[0]) for part in deliver_value.split(","))
+    msg = f"no delivery target resolved for deliver={deliver_value}{hints}"
     logger.warning("Job '%s': %s", job["id"], msg)
     return msg
 
