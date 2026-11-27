@@ -182,11 +182,60 @@ def test_spent_window_holds_env_tokens_and_is_reported_as_a_cooldown(tmp_path, m
     assert excinfo.value.code == "model_rate_limited"
     assert is_rate_limited_auth_error(excinfo.value)  # gateway / Kanban / fallback treat it as quota, not login
     assert "cooling down" in str(excinfo.value) and "No Anthropic credentials" not in str(excinfo.value)
+    from cron.quota_hold import hold_seconds_from_failure
+    assert 63 * 3600 - 60 < hold_seconds_from_failure(excinfo.value) <= 63 * 3600  # cron holds until the reset
+
+
+@pytest.mark.parametrize("claim, account_wide", [("seven_day", True), ("seven_day_opus", False)])
+def test_a_benched_env_token_beside_an_unusable_row_names_its_own_scope(tmp_path, monkeypatch, claim, account_wide):
+    """The pool is not all-429 (the other row is a 401), so the error is about the env token's own bench:
+    a spent account window refuses every model until its reset, a family window only the refused model."""
+    from agent.agent_runtime_helpers import extract_api_error_context
+    from agent.credential_pool import load_pool
+    from cron.quota_hold import hold_seconds_from_failure
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+
+    root = _isolated_home(tmp_path, monkeypatch)
+    (root / "auth.json").write_text(json.dumps({"credential_pool": {"anthropic": [
+        {"id": "spare", "label": "spare", "auth_type": "api_key", "priority": 0, "source": "manual",
+         "access_token": SPARE}]}}))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SPENT)
+    load_pool("anthropic").mark_exhausted_and_rotate(status_code=401, api_key_hint=SPARE, model=OPUS)
+    load_pool("anthropic").mark_exhausted_and_rotate(
+        status_code=429, error_context=extract_api_error_context(_plan_429(claim, time.time() + 63 * 3600)),
+        api_key_hint=SPENT, failure_reason="rate_limit", model=OPUS,
+    )
+
+    with pytest.raises(AuthError) as excinfo:
+        _anthropic_token_or_raise(model=OPUS)
+    message = str(excinfo.value)
+    assert is_rate_limited_auth_error(excinfo.value)
+    assert ("every Claude model" in message) is account_wide
+    assert ("other Claude models remain available" in message) is not account_wide
+    assert 63 * 3600 - 60 < hold_seconds_from_failure(excinfo.value) <= 63 * 3600
+
+
+def test_auxiliary_client_skips_a_spent_env_token(tmp_path, monkeypatch):
+    """With no usable pool row the aux client falls back to the legacy resolver; it must pass its model
+    so a spent plan window keeps the env token out of titles and compression too."""
+    from agent.agent_runtime_helpers import extract_api_error_context
+    from agent.auxiliary_client import _try_anthropic
+    from agent.credential_pool import load_pool
+
+    _isolated_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SPENT)
+    assert _try_anthropic()[0] is not None  # control: the healthy env key serves aux
+    load_pool("anthropic").mark_exhausted_and_rotate(
+        status_code=429, error_context=extract_api_error_context(_plan_429("seven_day", time.time() + 63 * 3600)),
+        api_key_hint=SPENT, failure_reason="rate_limit", model=FABLE,
+    )
+    assert _try_anthropic() == (None, None)
 
 
 @pytest.mark.parametrize("status", [401, 402])
 def test_an_auth_or_billing_bench_is_not_reported_as_a_rate_limit(pool, status):
-    """Only a 429 bench is a cooldown; a fully benched pool after a 401/402 keeps the sign-in diagnostic."""
+    """A pool benched by 401/402 is not reported as a rate limit: it keeps the sign-in diagnostic."""
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     from hermes_cli.runtime_provider import _anthropic_token_or_raise
 
@@ -195,4 +244,84 @@ def test_an_auth_or_billing_bench_is_not_reported_as_a_rate_limit(pool, status):
     with pytest.raises(AuthError) as excinfo:
         _anthropic_token_or_raise(model=OPUS)
     assert not is_rate_limited_auth_error(excinfo.value)
-    assert "cooling down" not in str(excinfo.value)
+    assert "No Anthropic credentials found" in str(excinfo.value)
+
+
+def _env_key_beside_a_401_row(tmp_path, monkeypatch):
+    from agent.credential_pool import load_pool
+
+    root = _isolated_home(tmp_path, monkeypatch)
+    (root / "auth.json").write_text(json.dumps({"credential_pool": {"anthropic": [
+        {"id": "spare", "label": "spare", "auth_type": "api_key", "priority": 0, "source": "manual",
+         "access_token": SPARE}]}}))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SPENT)
+    load_pool("anthropic").mark_exhausted_and_rotate(status_code=401, api_key_hint=SPARE, model=OPUS)
+
+
+@pytest.mark.parametrize("account_hours, model_hours", [(1, 2), (2, 1)])
+def test_an_active_account_bench_is_named_whichever_cooldown_ends_last(tmp_path, monkeypatch, account_hours, model_hours):
+    from agent.agent_runtime_helpers import extract_api_error_context
+    from agent.credential_pool import load_pool
+    from cron.quota_hold import hold_seconds_from_failure
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+
+    _env_key_beside_a_401_row(tmp_path, monkeypatch)
+    load_pool("anthropic").mark_exhausted_and_rotate(
+        status_code=429, error_context=extract_api_error_context(_plan_429("seven_day_opus", time.time() + model_hours * 3600)),
+        api_key_hint=SPENT, failure_reason="rate_limit", model=OPUS,
+    )
+    load_pool("anthropic").mark_exhausted_and_rotate(
+        status_code=429, error_context=extract_api_error_context(_plan_429("seven_day", time.time() + account_hours * 3600)),
+        api_key_hint=SPENT, failure_reason="rate_limit", model=FABLE,
+    )
+
+    with pytest.raises(AuthError) as excinfo:
+        _anthropic_token_or_raise(model=OPUS)
+    assert "every Claude model" in str(excinfo.value)
+    assert "remain available" not in str(excinfo.value)
+    latest = max(account_hours, model_hours) * 3600
+    assert latest - 60 < hold_seconds_from_failure(excinfo.value) <= latest
+
+
+def test_a_fully_benched_pool_holds_until_the_requested_model_is_free(pool):
+    from agent.agent_runtime_helpers import extract_api_error_context
+    from cron.quota_hold import hold_seconds_from_failure
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+
+    for key, claim, hours in ((SPENT, "seven_day_opus", 63), (SPENT, "seven_day", 1), (SPARE, "seven_day", 63)):
+        pool.mark_exhausted_and_rotate(
+            status_code=429, error_context=extract_api_error_context(_plan_429(claim, time.time() + hours * 3600)),
+            api_key_hint=key, failure_reason="rate_limit", model=OPUS,
+        )
+    with pytest.raises(AuthError) as excinfo:
+        _anthropic_token_or_raise(model=OPUS)
+    assert "cooling down" in str(excinfo.value)
+    assert 63 * 3600 - 60 < hold_seconds_from_failure(excinfo.value) <= 63 * 3600
+
+
+def test_auxiliary_fallback_keeps_an_env_token_benched_for_another_model_only(tmp_path, monkeypatch):
+    from agent.agent_runtime_helpers import extract_api_error_context
+    from agent.auxiliary_client import _try_anthropic
+    from agent.credential_pool import load_pool
+
+    _isolated_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SPENT)
+    load_pool("anthropic").mark_exhausted_and_rotate(
+        status_code=429, error_context=extract_api_error_context(_plan_429("seven_day_opus", time.time() + 63 * 3600)),
+        api_key_hint=SPENT, failure_reason="rate_limit", model=OPUS,
+    )
+    assert _try_anthropic()[0] is not None
+    assert _try_anthropic(requested_model=f"anthropic/{OPUS}") == (None, None)
+
+
+def test_api_key_aux_chain_moves_past_a_refused_anthropic_client(monkeypatch):
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    monkeypatch.setattr(aux, "_try_anthropic", lambda: (None, None))
+    tried = []
+    monkeypatch.setattr(aux, "_is_provider_unhealthy", lambda pid: tried.append(pid) and False)
+    aux._resolve_api_key_provider()
+    assert tried.index("anthropic") < len(tried) - 1

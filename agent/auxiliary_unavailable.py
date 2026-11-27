@@ -55,8 +55,23 @@ def _sentence(text: object) -> str:
     return str(text).strip().rstrip(".") + "."
 
 
-def pool_cooldown_message(provider_id: str, *, rate_limited_only: bool = False) -> Optional[str]:
-    """The "all N credentials … are cooling down" error when the provider's pool is fully benched.
+def pool_cooldown_message(provider_id: str) -> Optional[str]:
+    """The "all N credentials … are cooling down" error when the provider's pool is fully benched
+    (see :func:`pool_cooldown`), or ``None``."""
+    cooldown = pool_cooldown(provider_id)
+    return cooldown[0] if cooldown else None
+
+
+def format_local_reset(epoch: float) -> str:
+    return safe_strftime(datetime.fromtimestamp(epoch).astimezone(), "%Y-%m-%d %H:%M %Z")
+
+
+def pool_cooldown(
+    provider_id: str, *, rate_limited_only: bool = False, model: Optional[str] = None,
+) -> Optional[tuple[str, float]]:
+    """``(message, reset epoch)``: the "all N credentials … are cooling down" error when the
+    provider's pool is fully benched, and when the first credential can serve again (for *model*,
+    counting its model cooldowns too).
 
     ``resolve_provider_client()`` returns ``None`` both when no credential exists and when every
     pool entry sits in a 429/quota cooldown, so the raise sites could only say "no credentials
@@ -67,6 +82,7 @@ def pool_cooldown_message(provider_id: str, *, rate_limited_only: bool = False) 
     unless every live bench is a 429, so an auth or billing bench keeps its own remedy.
     """
     from agent.credential_pool import STATUS_DEAD, PooledCredential, _exhausted_until
+    from agent.credential_pool_model_cooldowns import model_cooldown_until
     from hermes_cli.auth import read_credential_pool
 
     entries = []
@@ -77,18 +93,19 @@ def pool_cooldown_message(provider_id: str, *, rate_limited_only: bool = False) 
     if not live or (rate_limited_only and any(e.last_error_code != 429 for e in live)):
         return None
     now = time.time()
-    resets = [until for e in live
+    resets = [max(until, (model and model_cooldown_until(e, model)) or 0) for e in live
               for until in (_exhausted_until(e, sole_credential=len(live) == 1),)
               if until is not None and until > now]
     if len(resets) != len(live):
         return None
-    when = safe_strftime(datetime.fromtimestamp(min(resets)).astimezone(), "%Y-%m-%d %H:%M %Z")
+    reset = min(resets)
+    when = format_local_reset(reset)
     which = ("its only credential is" if len(live) == 1
              else f"all {len(live)} credentials are")
     return (f"Provider '{provider_id}' is set in config.yaml but {which} cooling down after a "
             f"rate limit / quota error (429); the next one resets at {when}. Wait for the reset, "
             f"add another credential with `hermes auth add {provider_id}`, or switch to a "
-            "different provider with `hermes model`.")
+            "different provider with `hermes model`.", reset)
 
 
 class ProviderCredentialsExhaustedError(RuntimeError):

@@ -107,25 +107,36 @@ def merge_model_cooldowns(*maps: Any) -> dict[str, float]:
 
 class CredentialPoolModelCooldownMixin:
     def token_is_blocked(self, token: str, *, model: Optional[str] = None) -> bool:
-        """Whether a pool cooldown blocks *token* for *model*: a cooldown on that model, or a
-        credential-wide 429 bench (a spent plan window refuses every model).
+        """Whether a pool cooldown blocks *token* for *model* (see :meth:`token_cooldown`).
 
         Closes the paths that hand out a native Anthropic token without
         selecting it from the pool (env / borrowed credentials). Tokens the
         pool does not know fail open: no row can attribute a cooldown to them.
         """
+        return self.token_cooldown(token, model=model) is not None
+
+    def token_cooldown(self, token: str, *, model: Optional[str] = None) -> Optional[tuple[bool, float]]:
+        """``(account_wide, until)`` when a cooldown blocks *token* on *model*, else ``None``.
+
+        *account_wide*: a credential-wide 429 bench is active, so every model is refused (a spent
+        plan window). *until*: when the last cooldown blocking *model* ends (any model's when
+        *model* is ``None``, as in :func:`model_cooldown_until`).
+        """
         from agent.credential_pool import _exhausted_until
 
         now = time.time()
+        account: list[float] = []
+        scoped: list[float] = []
         with self._lock:
             sole = self._is_sole_credential()
-            return any(
-                entry.runtime_api_key == token and (
-                    model_cooldown_until(entry, model) is not None
-                    or (entry.last_error_code == 429 and (_exhausted_until(entry, sole_credential=sole) or 0) > now)
-                )
-                for entry in self._entries
-            )
+            for entry in self._entries:
+                if entry.runtime_api_key != token:
+                    continue
+                if entry.last_error_code == 429 and (until := _exhausted_until(entry, sole_credential=sole) or 0) > now:
+                    account.append(until)
+                if (until := model_cooldown_until(entry, model)) is not None:
+                    scoped.append(until)
+        return (bool(account), max(account + scoped)) if account or scoped else None
 
     def _is_model_scoped_failure(
         self, status_code: Optional[int], model: Optional[str], failure_reason: Optional[str],
