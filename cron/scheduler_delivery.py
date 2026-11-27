@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from gateway.inbound_reply_context import record_cron_delivery, recording_cron_delivery
+from gateway.outbound.targets import unknown_platform_error
 
 
 # Log-record parity with the origin module.
@@ -425,12 +426,69 @@ def _plugin_cron_env_var(platform_name: str) -> str:
 def _is_known_delivery_platform(platform_name: str) -> bool:
     """Valid cron delivery platform: built-in, or plugin with a ``cron_deliver_env_var``."""
     name = platform_name.lower()
-    return name in _KNOWN_DELIVERY_PLATFORMS or bool(_plugin_cron_env_var(name))
+    return name in _KNOWN_DELIVERY_PLATFORMS or bool(_resolve_home_env_var(name))
+
+
+def moved_platform_hint(platform_name: str) -> str:
+    """``". <label> moved out of core into the '<plugin>' plugin: install it with `<command>`"`` for a
+    platform that left core whose plugin is not loaded, else ``""``: a route saved while core shipped it
+    names the install instead of failing as an unknown target."""
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.left_core_migration import platform_install_hint
+    name = platform_name.strip().lower()
+    return "" if platform_registry.get(name) else platform_install_hint(name)
+
+
+def _primary_registration(platform_key: str):
+    """The primary's loaded ``PlatformEntry`` for *platform_key*, or ``None``: a moved platform's ref syntax."""
+    from gateway.platform_registry import platform_registry
+    from hermes_constants import get_default_hermes_root, hermes_home_key
+    return platform_registry.snapshot_registration(platform_key, scope=hermes_home_key(get_default_hermes_root()))[0]
+
+
+def _moved_platform_ref(platform_key: str, ref: str) -> tuple[str, Optional[str]]:
+    """``(chat_id, thread_id)`` of a moved platform's ref when its plugin is not loaded here: the
+    primary's already-loaded plugin parser when it reads the ref, else core's generic
+    ``chat[:thread]`` split. Only an exact route match on the result sends anything."""
+    entry = _primary_registration(platform_key)
+    parse = entry.parse_target_ref_fn if entry is not None else None
+    parsed = None
+    if parse is not None:
+        try:
+            parsed = parse(ref)
+        except Exception:
+            logger.debug("Primary's target parser failed for %s", platform_key, exc_info=True)
+    if isinstance(parsed, tuple) and len(parsed) == 2 and parsed[0]:
+        return str(parsed[0]), str(parsed[1]) if parsed[1] else None
+    chat_id, _, thread_id = ref.partition(":")
+    return chat_id, thread_id or None
+
+
+def resolve_cron_destination(
+    job: dict, deliver_value: str, *, from_broadcast: bool = False
+) -> tuple[Optional[dict], Optional[str]]:
+    """``(target, error)`` for one destination: delivery's resolver, and preflight's dry run of it.
+    A platform that left core and whose plugin is not loaded here is served only by the primary's
+    bot through an exact route on the parsed chat; when none serves it the error names the install."""
+    target = _resolve_single_delivery_target(job, deliver_value, from_broadcast=from_broadcast)
+    platform_name = str(target["platform"] if target else deliver_value.split(":", 1)[0]).strip()
+    if not moved_platform_hint(platform_name) or (target and _preflight.shared_route_serves(target)):
+        return target, None
+    return None, unknown_platform_error(platform_name)
 
 
 def _resolve_home_env_var(platform_name: str) -> str:
-    """Env var name for a platform's cron home channel (``PlatformEntry.cron_deliver_env_var``)."""
-    return _plugin_cron_env_var(platform_name.lower())
+    """Env var name for a platform's cron home channel (``PlatformEntry.cron_deliver_env_var``). A moved
+    platform whose plugin is not loaded here takes the name from the primary's registration, else from what core
+    read (a managed worker has no registration), so its home address resolves like an explicit chat and
+    ``resolve_cron_destination`` sends it only where a route serves it."""
+    name = platform_name.lower()
+    env_var = _plugin_cron_env_var(name)
+    if env_var or not moved_platform_hint(name):
+        return env_var
+    from hermes_cli.left_core_migration import platform_home_env_var
+    entry = _primary_registration(name)
+    return (entry is not None and entry.cron_deliver_env_var) or platform_home_env_var(name)
 
 
 def _get_config_home_channel(platform_name: str):
@@ -657,6 +715,9 @@ def _resolve_single_delivery_target(
         # must reach the adapter as written or the job's output is silently lost.
         chat_id, thread_id, resolution_error = resolve_send_target(
             platform_key, rest, pass_unresolved_references=True)
+        if resolution_error and moved_platform_hint(platform_key):
+            # No plugin here to parse it; resolve_cron_destination sends it only where a route serves it.
+            (chat_id, thread_id), resolution_error = _moved_platform_ref(platform_key, rest), None
         if resolution_error:
             logger.warning("Invalid cron delivery target '%s': %s", deliver_value, resolution_error)
             return None
@@ -906,12 +967,16 @@ def _snapshot_delivery_job(job: Mapping[str, Any]) -> dict[str, Any]:
     return snapshot
 
 
-def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[dict]:
+def _resolve_delivery_targets(
+    job: dict, *, for_failure: bool = False, moved_errors: Optional[list] = None
+) -> list[dict]:
     """Resolve auto-delivery targets from comma-separated ``deliver``; ``all`` expands to every
     platform with a home channel and combines with explicit targets. Dedup by (platform, chat_id,
     thread_id). ``for_failure=True`` (failure summaries, interrupted-run notices, drift/preflight
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
-    ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
+    ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``.
+    ``moved_errors`` collects the install error of each destination skipped because its platform left
+    core and its plugin is not loaded, so a run that reached the others still reports it."""
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     if deliver == "local":
         return []
@@ -924,7 +989,9 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[d
             continue
         from_broadcast = raw.lower() in _ROUTING_TOKENS
         for part in _expand_routing_tokens(raw):
-            target = _resolve_single_delivery_target(job, part, from_broadcast=from_broadcast)
+            target, error = resolve_cron_destination(job, part, from_broadcast=from_broadcast)
+            if error and moved_errors is not None:
+                moved_errors.append(error)
             if not target:
                 continue
             key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
@@ -939,6 +1006,16 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[d
             ):
                 kept["_resolved_from"] = target.get("_resolved_from")
     return targets
+
+
+def _origin_unresolved(job: dict, *, for_failure: bool = False) -> bool:
+    """``deliver: origin`` with nothing to deliver to (no origin, no home): not a failure. An origin
+    ``resolve_cron_destination`` refused (its platform left core, no route serves it) is not this
+    case; the run still reports the install."""
+    moved_errors: list = []
+    return (_normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure)) == "origin"
+            and not _resolve_delivery_targets(job, for_failure=for_failure, moved_errors=moved_errors)
+            and not moved_errors)
 
 
 def _resolve_delivery_target(job: dict) -> Optional[dict]:
@@ -1631,7 +1708,9 @@ def _prepare_target_delivery(
     try:
         platform = Platform(platform_name.lower())
     except (ValueError, KeyError):
-        _note_target_error(job, f"unknown platform '{platform_name}'", delivery_errors)
+        error = unknown_platform_error(platform_name) if moved_platform_hint(platform_name) else (
+            f"unknown platform '{platform_name}'")
+        _note_target_error(job, error, delivery_errors)
         return None
 
     resolved, resolve_err = _resolve_target_transport(
@@ -1697,14 +1776,14 @@ def _prepare_target_delivery(
         opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
 
 
-def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
+def _unresolved_delivery_outcome(job: dict, for_failure: bool, moved_errors: list) -> Optional[str]:
     """``_deliver_result`` outcome when no target resolved: None (not a failure) for ``local`` and
     origin-less ``origin`` (CLI jobs never capture an origin — a spurious error every run), else
-    an error string."""
+    an error string carrying ``moved_errors`` (destinations whose platform plugin is not loaded)."""
     deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     if deliver_value == "local":
         return None
-    if deliver_value == "origin":
+    if deliver_value == "origin" and not moved_errors:
         logger.info(
             # deliver=origin with no resolvable origin and no configured home channels: treat as local
             # rather than reporting an error. CLI-created jobs never capture a {platform, chat_id} origin,
@@ -1715,7 +1794,7 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
             "skipping delivery (output saved in last_output)",
             job.get("name", job.get("id", "?")))
         return None
-    msg = f"no delivery target resolved for deliver={deliver_value}"
+    msg = "; ".join([f"no delivery target resolved for deliver={deliver_value}", *moved_errors])
     logger.warning("Job '%s': %s", job["id"], msg)
     return msg
 
@@ -1742,9 +1821,11 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
-    targets = _resolve_delivery_targets(job, for_failure=for_failure)
+    moved_errors: list = []
+    targets = _resolve_delivery_targets(job, for_failure=for_failure, moved_errors=moved_errors)
     if not targets:
-        job["_delivery_reached_none"] = (outcome := _unresolved_delivery_outcome(job, for_failure)) is not None
+        job["_delivery_reached_none"] = (
+            outcome := _unresolved_delivery_outcome(job, for_failure, moved_errors)) is not None
         _record_delivery_verification(job, [])
         return outcome
 
@@ -1837,7 +1918,7 @@ def _deliver_result(
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
 
-    delivery_errors = []
+    delivery_errors = list(moved_errors)
     reached = 0  # targets that received the text (bot chat / room / local count when error-free)
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
     for target in targets:

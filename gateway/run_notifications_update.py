@@ -11,6 +11,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -122,6 +123,12 @@ class GatewayUpdateNotificationsMixin:
             return profile_from_session_key_namespace(parts[1])
         return None
 
+    @classmethod
+    def _marker_bot_profile(cls, data: dict) -> Optional[str]:
+        """Profile whose bot answers an update marker: the receiving bot (``transport_profile``) when the
+        writer knew it, else the owning profile (``_marker_profile``)."""
+        return str(data.get("transport_profile") or "").strip() or cls._marker_profile(data)
+
     @staticmethod
     def _marker_age_seconds(data: dict) -> Optional[float]:
         """Age of a persisted update marker, from the ``timestamp`` stamped by its writer.
@@ -172,9 +179,9 @@ class GatewayUpdateNotificationsMixin:
                 if not (platform_str and chat_id):
                     continue  # BASE: an incomplete marker falls through to the next path, not "unresolved"
                 platform = Platform(platform_str)
-                # The requester's OWN profile bot (marker ``profile``, else the ``agent:<profile>:`` key
-                # lane); a bare self.adapters lookup is the default bot under multiplex.
-                profile = self._marker_profile(pending)
+                # The receiving bot, else the requester's OWN profile bot (marker ``profile``, else the
+                # ``agent:<profile>:`` key lane); a bare self.adapters lookup is the default bot under multiplex.
+                profile = self._marker_bot_profile(pending)
                 adapter = self._authorization_adapter(platform, profile)
                 if not adapter:
                     return None
@@ -364,11 +371,19 @@ class GatewayUpdateNotificationsMixin:
                 return _defer("Update notification deferred: update still running")
             exit_code = self._update_exit_code(paths)
             output = paths.output.read_bytes().decode("utf-8", errors="replace") if paths.output.exists() else ""
-            platform = Platform(platform_str)
-            adapter = self._authorization_adapter(platform, self._marker_profile(pending))
+            # A plugin platform registers during startup, possibly after this first pass: until then
+            # its name is not a Platform, and that is the same wait as an adapter still reconnecting.
+            try:
+                platform = Platform(platform_str)
+            except ValueError:
+                platform = None
+            adapter = self._authorization_adapter(platform, self._marker_bot_profile(pending)) if platform else None
             if chat_id and not adapter:
+                # A marker written before ``timestamp`` existed is as old as its file (a rename keeps mtime).
                 age = self._marker_age_seconds(pending)
-                if age is not None and age > _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS:
+                if age is None:
+                    age = time.time() - paths.claimed.stat().st_mtime
+                if age and age > _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS:
                     # The platform never came back. Deferring forever leaks the markers and re-logs
                     # on every poll for the life of the install: the startup path reschedules this
                     # watcher whenever the markers are still on disk, so an undeliverable marker

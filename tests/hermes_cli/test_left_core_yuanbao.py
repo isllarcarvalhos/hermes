@@ -161,20 +161,20 @@ def test_plugins_disabled_naming_the_bundled_adapter_is_not_use_and_still_disabl
 
 def test_a_bare_yuanbao_in_plugins_disabled_is_still_use(tmp_path):
     """Core's adapter was ``platforms/yuanbao`` / ``yuanbao-platform``: a bare ``yuanbao`` never stopped it, so
-    the home gets the plugin. The install's enable lifts that entry; one that survives it (a managed overlay
-    pin) now turns the plugin off, and the notice says so."""
+    the home gets the plugin. The automatic install keeps that entry (only the user's enable lifts it), so it
+    now turns the plugin off, and the notice says so and names the enable."""
     from hermes_cli.config import read_user_config_raw
     home = _home(tmp_path, env="YUANBAO_APP_ID=a\nYUANBAO_APP_SECRET=s\n",
                  config="plugins:\n  disabled: [yuanbao]\n")
     assert lcm.yuanbao_in_use(home) is True
-    sentence = "plugins.disabled lists 'yuanbao', which now turns Yuanbao off; remove it to keep using Yuanbao"
+    sentence = "plugins.disabled lists 'yuanbao', which now turns Yuanbao off: `hermes plugins enable yuanbao` turns it on"
     for lifted in (True, False):
         (home / "config.yaml").write_text("plugins:\n  disabled: [yuanbao]\n", encoding="utf-8")
         said = []
 
         def install(name):
             (home / "plugins" / name).mkdir(parents=True, exist_ok=True)
-            if lifted:  # what the real enable does (_apply_activation)
+            if lifted:  # an enable lifts it (_apply_activation)
                 (home / "config.yaml").write_text("plugins:\n  enabled: [yuanbao]\n  disabled: []\n", encoding="utf-8")
             return {"ok": True}
 
@@ -229,3 +229,24 @@ def test_a_disabled_hermes_yuanbao_bundle_keeps_the_yb_tools_disabled(tmp_path, 
     from hermes_cli.config import read_user_config_raw
     assert read_user_config_raw(home / "config.yaml")["agent"]["disabled_toolsets"] == [
         bundle, "memory", "yuanbao"]
+
+
+def test_a_present_plugin_the_home_disables_is_said_off_once_and_stays_disabled(tmp_path):
+    """Greptile #159640: core ran Yuanbao despite a bare ``yuanbao`` in plugins.disabled; the plugin the home
+    already has honours it, so the upgrade turns Yuanbao off. Nothing installs or lifts the entry, and the
+    home is told once."""
+    from hermes_cli.config import read_user_config_raw
+    home = _home(tmp_path, env="YUANBAO_APP_ID=a\nYUANBAO_APP_SECRET=s\n", config="plugins:\n  disabled: [yuanbao]\n")
+    (home / "plugins" / "yuanbao").mkdir(parents=True)
+    calls, said = [], []
+
+    def install(name):
+        calls.append(name)
+        return {"ok": True}
+
+    assert lcm.migrate_home(home, install=install, say=said.append) == []
+    assert lcm.migrate_home(home, install=install, say=said.append) == []
+    assert calls == []
+    assert read_user_config_raw(home / "config.yaml")["plugins"]["disabled"] == ["yuanbao"]
+    off = [line for line in said if "which now turns Yuanbao off" in line]
+    assert len(off) == 1 and "`hermes plugins enable yuanbao` turns it on" in off[0], said
